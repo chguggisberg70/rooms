@@ -1,0 +1,10 @@
+playwright==1.46.0
+pandas
+python-dateutil
+requests
+google-api-python-client
+google-auth
+google-auth-oauthlib
+pyyaml
+openpyxl
+ics
