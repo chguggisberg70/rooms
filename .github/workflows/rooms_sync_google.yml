@@ -1,0 +1,72 @@
+name: rooms_sync_google
+
+on:
+  schedule:
+    - cron: '0 6,11,16 * 3-10 1-6'
+    - cron: '0 7,12,17 * 11-12 1-6'
+    - cron: '0 7,12,17 * 1-2 1-6'
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TZ: Europe/Zurich
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps (pip + Playwright)
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Write Google credentials (optional)
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
+        run: |
+          if [ -n "${GOOGLE_CREDENTIALS_JSON}" ]; then
+            echo "${GOOGLE_CREDENTIALS_JSON}" > credentials.json
+          fi
+          if [ -n "${GOOGLE_TOKEN_JSON}" ]; then
+            echo "${GOOGLE_TOKEN_JSON}" > token.json
+          fi
+
+      - name: Write storage_state.json from secret
+        env:
+          STORAGE_STATE_JSON: ${{ secrets.STORAGE_STATE_JSON }}
+        run: |
+          if [ -z "${STORAGE_STATE_JSON}" ]; then
+            echo "Secret STORAGE_STATE_JSON fehlt"; exit 1
+          fi
+          echo "${STORAGE_STATE_JSON}" > storage_state.json
+
+      - name: Run rooms_sync_google.py
+        run: |
+          python rooms_sync_google.py \
+            --calendar "Rooms_BFH_Kilchenmann" \
+            --storage-state storage_state.json \
+            --range-days 7
+
+      - name: Upload artifacts (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rooms-artifacts
+          path: |
+            artifacts_sync/**
+            artifacts_ui/**
+            **/*.log
+          if-no-files-found: ignore
+
+      - name: Cleanup (optional)
+        if: always()
+        run: rm -f storage_state.json credentials.json token.json || true
