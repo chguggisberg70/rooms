@@ -40,21 +40,22 @@ jobs:
             echo "${GOOGLE_TOKEN_JSON}" > token.json
           fi
 
-      - name: Write storage_state.json from secret
-        env:
-          STORAGE_STATE_JSON: ${{ secrets.STORAGE_STATE_JSON }}
-        run: |
-          if [ -z "${STORAGE_STATE_JSON}" ]; then
-            echo "Secret STORAGE_STATE_JSON fehlt"; exit 1
-          fi
-          echo "${STORAGE_STATE_JSON}" > storage_state.json
+      # storage_state nur nötig, wenn dein Script das Argument unterstützt
+      # - name: Write storage_state.json from secret
+      #   env:
+      #     STORAGE_STATE_JSON: ${{ secrets.STORAGE_STATE_JSON }}
+      #   run: |
+      #     if [ -z "${STORAGE_STATE_JSON}" ]; then
+      #       echo "Secret STORAGE_STATE_JSON fehlt"; exit 1
+      #     fi
+      #     echo "${STORAGE_STATE_JSON}" > storage_state.json
 
       - name: Run rooms_sync_google.py
         run: |
           python rooms_sync_google.py \
             --calendar "Rooms_BFH_Kilchenmann" \
-            --storage-state storage_state.json \
-            --range-days 7
+            --split-by standort \
+            --timeout 240000
 
       - name: Upload artifacts (optional)
         if: always()
