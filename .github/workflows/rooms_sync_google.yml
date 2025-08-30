@@ -1,73 +1,75 @@
-name: rooms_sync_google
+name: BFH Rooms Sync
 
 on:
   schedule:
+    # Deine Cron-Jobs für die automatische Ausführung
     - cron: '0 6,11,16 * 3-10 1-6'
     - cron: '0 7,12,17 * 11-12 1-6'
     - cron: '0 7,12,17 * 1-2 1-6'
   workflow_dispatch:
 
 jobs:
-  run:
+  run-sync:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
+      # Setzt die Zeitzone für den Server korrekt
       TZ: Europe/Zurich
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          
+      # Caching für pip, um die Installation zu beschleunigen
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-      - name: Install deps (pip + Playwright)
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # Caching für den Playwright-Browser, um den Download zu beschleunigen
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright browser
+        # Dieser Befehl installiert den Chromium-Browser und alle System-Abhängigkeiten
+        run: python -m playwright install --with-deps chromium
+
+      - name: Restore Google Credentials
+        # Erstellt die credential-Dateien aus den sicheren GitHub Secrets
         run: |
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
-
-      - name: Write Google credentials (optional)
-        env:
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-          GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
-        run: |
-          if [ -n "${GOOGLE_CREDENTIALS_JSON}" ]; then
-            echo "${GOOGLE_CREDENTIALS_JSON}" > credentials.json
-          fi
-          if [ -n "${GOOGLE_TOKEN_JSON}" ]; then
-            echo "${GOOGLE_TOKEN_JSON}" > token.json
-          fi
-
-      # storage_state nur nötig, wenn dein Script das Argument unterstützt
-      # - name: Write storage_state.json from secret
-      #   env:
-      #     STORAGE_STATE_JSON: ${{ secrets.STORAGE_STATE_JSON }}
-      #   run: |
-      #     if [ -z "${STORAGE_STATE_JSON}" ]; then
-      #       echo "Secret STORAGE_STATE_JSON fehlt"; exit 1
-      #     fi
-      #     echo "${STORAGE_STATE_JSON}" > storage_state.json
-
-      - name: Run rooms_sync_google.py
+          echo "${{ secrets.GOOGLE_CREDENTIALS_JSON }}" > credentials.json
+          echo "${{ secrets.GOOGLE_TOKEN_JSON }}" > token.json
+      
+      - name: Run BFH Rooms Sync
+        # Führt das Skript aus und übergibt das neue --headless Argument
         run: |
           python rooms_sync_google.py \
             --calendar "Rooms_BFH_Kilchenmann" \
             --split-by standort \
+            --headless \
             --timeout 240000
 
-      - name: Upload artifacts (optional)
+      - name: Upload artifacts for debugging
+        # Lädt bei Erfolg oder Fehlschlag die erstellten Dateien hoch
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rooms-artifacts
-          path: |
-            artifacts_sync/**
-            artifacts_ui/**
-            **/*.log
+          path: artifacts_sync/
           if-no-files-found: ignore
-
-      - name: Cleanup (optional)
-        if: always()
-        run: rm -f storage_state.json credentials.json token.json || true
