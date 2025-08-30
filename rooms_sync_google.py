@@ -374,16 +374,27 @@ class BFHScraper:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.context: await self.context.close()
 
-    async def navigate_and_filter(self, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> bool:
-        logging.info(f"Navigating to {Config.FIND_URL}...")
-        await self.page.goto(Config.FIND_URL, wait_until="domcontentloaded", timeout=90000)
-        try:
-            await self.page.wait_for_load_state("networkidle", timeout=15000)
-        except PWTimeoutError:
-            logging.warning("Network idle timeout reached on initial load, continuing anyway.")
+    # ERSETZE DIE BISHERIGE navigate_and_filter FUNKTION MIT DIESER
 
-        logging.info("Setting side panel filters...")
+async def navigate_and_filter(self, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> bool:
+    """Navigates to the reservation page, applies filters, and waits for results."""
+    logging.info(f"Navigating to {Config.FIND_URL}...")
+    # Wir geben der Seite mehr Zeit zum Laden, falls sie langsam ist
+    await self.page.goto(Config.FIND_URL, wait_until="domcontentloaded", timeout=90000)
+    try:
+        await self.page.wait_for_load_state("networkidle", timeout=15000)
+    except PWTimeoutError:
+        logging.warning("Network idle timeout reached on initial load, continuing anyway.")
+
+    logging.info("Setting side panel filters...")
+    
+    # NEU: Wir machen einen Screenshot direkt bevor wir die Checkbox suchen
+    await self.page.screenshot(path=Config.ARTIFACTS_DIR / "debug_before_check.png")
+
+    try:
+        # Der Befehl, der aktuell fehlschlägt
         await self.page.locator("#ReservationFilter_ManualDateTimeSelection").check(timeout=5000)
+        
         await self.page.evaluate(f"document.querySelector('#ReservationFilter_Beginn').value = '{format_for_sidepanel(start_ts)}'")
         await self.page.evaluate(f"document.querySelector('#ReservationFilter_Ende').value = '{format_for_sidepanel(end_ts)}'")
         
@@ -398,10 +409,17 @@ class BFHScraper:
                 logging.warning("Timeout waiting for network idle after search. The page might be slow or stuck.")
             return True
         
-        logging.warning("Could not find 'Finden' button, trying form submit.")
-        await self.page.evaluate("document.querySelector('#sidePanelForm').submit()")
-        return True
-
+    except PWTimeoutError as e:
+        logging.error("Checkbox for manual date selection not found!")
+        # NEU: Wir machen einen Screenshot genau im Moment des Fehlers
+        await self.page.screenshot(path=Config.ARTIFACTS_DIR / "debug_on_failure.png")
+        logging.error("A screenshot named 'debug_on_failure.png' has been saved to the artifacts.")
+        # Wir werfen den Fehler erneut, damit der Workflow korrekt als fehlgeschlagen markiert wird
+        raise e
+    
+    logging.warning("Could not find 'Finden' button, trying form submit.")
+    await self.page.evaluate("document.querySelector('#sidePanelForm').submit()")
+    return True
     async def close_toasts(self):
         for selector in Config.TOAST_CLOSE_SELECTORS:
             buttons = self.page.locator(selector)
