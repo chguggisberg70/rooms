@@ -376,7 +376,7 @@ class BFHScraper:
 
     async def navigate_and_filter(self, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> bool:
         logging.info(f"Navigating to {Config.FIND_URL}...")
-        await self.page.goto(Config.FIND_URL, wait_until="domcontentloaded")
+        await self.page.goto(Config.FIND_URL, wait_until="domcontentloaded", timeout=90000)
         try:
             await self.page.wait_for_load_state("networkidle", timeout=15000)
         except PWTimeoutError:
