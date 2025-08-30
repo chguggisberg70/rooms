@@ -10,7 +10,7 @@ on:
 
 jobs:
   run-sync:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 45
     env:
       # Setzt die Zeitzone für den Server korrekt
@@ -73,3 +73,4 @@ jobs:
           name: rooms-artifacts
           path: artifacts_sync/
           if-no-files-found: ignore
+
