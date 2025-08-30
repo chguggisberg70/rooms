@@ -1,30 +1,30 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-rooms_sync_google.py
+BFH Rooms to Google Calendar Sync (Delta-Sync Version)
 
-Optional:
-- --split-by standort / gebaeude
-- --no-chunk um Tages-Splitting 06-22 abzuschalten
-Zusaetzlich: HTML-Tafel (artifacts_sync/schedule.html)
-
-Start (PowerShell):
-  $env:ROOMS_USER="dein@login"
-  $env:ROOMS_PASS="deinpass"
-  python rooms_sync_google.py --calendar "Rooms_BFH_Kilchenmann" --split-by standort --timeout 240000 --prefer-grid
+Features:
+- Scans a 3-day window (today to +3 days) for room reservations.
+- Performs a "delta" sync: only new, changed, or canceled events are updated.
+- User modifications to unchanged events (notes, colors) are preserved.
+- Robustly exports data via CSV, handling various notification types.
+- Includes a failsafe mechanism by scraping the Kendo UI grid if CSV is unavailable.
+- Syncs with Google Calendar in efficient, rate-limit-friendly chunks.
+- Supports splitting events into separate calendars by location or building (--split-by).
+- Optionally generates a local HTML timeline view of the reservations (--html).
 """
 
 import argparse
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import time
-import smtplib, ssl
-from email.message import EmailMessage
 from datetime import date, timedelta
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 
 import pandas as pd
 from dateutil import tz
@@ -33,1323 +33,685 @@ from playwright.async_api import (
     Page,
     Frame,
     TimeoutError as PWTimeoutError,
+    Locator,
 )
-
-# Google
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.http import BatchHttpRequest
+from tqdm import tqdm
 
-# ------------------ Konfiguration ------------------
-BASE = "https://bfh.book.3vrooms.app"
-URL_FIND = f"{BASE}/Default/Lists/Reservation/FindReservation"
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-USER_DATA_DIR = SCRIPT_DIR / "pw_profile"  # persistentes Profil (kein staendiges Login)
-ARTIFACTS_DIR = SCRIPT_DIR / "artifacts_sync"
-ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+# ------------------ CONFIGURATION ------------------
+class Config:
+    """Central configuration for the script."""
 
-ROOMS_CSV_PATTERN = re.compile(
-    r"(export[_-]?reservation|reservation[_-]?export|reservation)", re.I
+    BASE_URL = "https://bfh.book.3vrooms.app"
+    FIND_URL = f"{BASE_URL}/Default/Lists/Reservation/FindReservation"
+
+    # --- Directories and Files ---
+    ARTIFACTS_DIR = Path("artifacts_sync")
+    USER_PROFILE_DIR = "pw_profile"
+    CREDENTIALS_FILE = Path("credentials.json")
+    TOKEN_FILE = Path("token.json")
+
+    # --- Time Settings ---
+    LOCAL_TIMEZONE_NAME = "Europe/Zurich"
+    LOCAL_TIMEZONE = tz.gettz(LOCAL_TIMEZONE_NAME)
+    SYNC_WINDOW_DAYS = 3
+    GCAL_DELETE_HORIZON_DAYS = 8
+
+    # --- Google Calendar ---
+    GCAL_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+    GCAL_SOURCE_TAG = "bfh-rooms-sync"
+    DEFAULT_CALENDAR_NAME = "Rooms_BFH"
+    GCAL_BATCH_CHUNK_SIZE = 50
+
+    # --- Patterns & Selectors ---
+    CSV_FILENAME_PATTERN = re.compile(
+        r"(export[_-]?reservation|reservation[_-]?export|reservation)", re.IGNORECASE
+    )
+    EXPORT_BUTTON_SELECTORS = [
+        "img[title='Export']",
+        "img[alt='Export']",
+        "#contentgrid i.k-i-excel",
+        "#contentgrid .fa-file-excel",
+        "button:has-text('Export')",
+        "input[value='Export']",
+    ]
+    FIND_BUTTON_SELECTORS = [
+        "#sidePanelForm button:has-text('Finden')",
+        "button:has-text('Finden')",
+        "input[type='submit'][value='Finden']",
+        "input[value='Finden']",
+    ]
+    TOAST_CLOSE_SELECTORS = [
+        ".notification-container.ui-notify .ui-notify-message img.ui-notify-close",
+        ".k-notification .k-notification-close",
+        ".k-notification .k-i-close",
+        "div[role='alert'] .k-i-close",
+    ]
+
+
+# Setup basic logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
 )
-LOCAL_TZ = tz.gettz("Europe/Zurich")
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
-SOURCE_TAG = "bfh-rooms-sync"
-
-# ------------------ Zeitraum ------------------
 
 
-def compute_window_days_7() -> Tuple[pd.Timestamp, pd.Timestamp]:
-    today = pd.Timestamp(date.today(), tz=LOCAL_TZ)
-    start = today.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = (today + pd.Timedelta(days=7)).replace(
-        hour=23, minute=59, second=59, microsecond=0
+# ------------------ TIME HELPERS ------------------
+def get_sync_window() -> Tuple[pd.Timestamp, pd.Timestamp]:
+    today = pd.Timestamp(date.today(), tz=Config.LOCAL_TIMEZONE)
+    start = today.normalize()
+    end = (today + timedelta(days=Config.SYNC_WINDOW_DAYS)).replace(
+        hour=23, minute=59, second=59, microsecond=999999
     )
     return start, end
 
 
-# ------------------ CSV robust laden ------------------
+def format_for_sidepanel(ts: pd.Timestamp) -> str:
+    return ts.strftime("%d.%m.%Y %H:%M")
 
 
-def read_csv_smart(path: Path) -> pd.DataFrame:
-    encodings = ["utf-8-sig", "utf-16", "utf-16-le", "cp1252", "latin1"]
-    for enc in encodings:
-        for header in [True, False]:
-            try:
-                if header:
-                    df = pd.read_csv(path, sep=None, engine="python", encoding=enc)
-                else:
-                    df = pd.read_csv(
-                        path, sep=None, engine="python", encoding=enc, header=None
-                    )
-                if df.shape[1] <= 1:
-                    df = pd.read_csv(
-                        path, sep=";", encoding=enc, header=(0 if header else None)
-                    )
-                return df
-            except Exception:
-                pass
-    raise RuntimeError(f"CSV konnte nicht gelesen werden: {path}")
-
-
-# ------------------ Normalisierung ------------------
-
-
-def extract_room_code(raum: str) -> str:
-    s = str(raum or "").strip()
+# ------------------ DATA NORMALIZATION ------------------
+def extract_room_code(room_name: str) -> str:
+    s = str(room_name or "").strip()
     if not s:
         return ""
     tokens = s.split()
     if not tokens:
         return ""
-    if any(ch.isdigit() for ch in tokens[0]):
-        code = tokens[0]
-        if (
-            len(tokens) >= 2
-            and (len(code) <= 2 and code.isalpha())
-            and any(ch.isdigit() for ch in tokens[1])
-        ):
+    if any(char.isdigit() for char in tokens[0]):
+        if len(tokens) > 1 and len(tokens[0]) <= 2 and tokens[0].isalpha():
             return f"{tokens[0]} {tokens[1]}"
-        return code
-    if len(tokens) >= 2 and any(ch.isdigit() for ch in tokens[1]):
+        return tokens[0]
+    if len(tokens) > 1 and any(char.isdigit() for char in tokens[1]):
         return f"{tokens[0]} {tokens[1]}"
     return tokens[0]
 
 
-def _guess_cols_by_content(
-    df: pd.DataFrame,
-) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    # Spaltennamen normalisieren
-    df = df.copy()
-    df.columns = [
-        str(c).replace("\u00a0", " ").replace("\u202f", " ").strip() for c in df.columns
-    ]
+def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    col_map = {str(c).lower(): str(c) for c in df.columns}
 
-    sample = df.head(120).copy()
-
-    def try_parse_dt(x):
-        s = str(x).replace("\u00a0", " ").replace("\u202f", " ").strip()
-        s = s.replace(" Uhr", "")
-        s = re.sub(r"^[A-Za-zÄÖÜäöüß]+\s*,\s*", "", s)
-        s = s.replace(",", " ")
-        return pd.to_datetime(s, dayfirst=True, errors="coerce")
-
-    # Datums-/Zeitspalten schaetzen (Schwelle entschaerft)
-    dt_scores = {
-        c: sample[c].apply(try_parse_dt).notna().mean() for c in sample.columns
-    }
-    dt_sorted = [
-        c
-        for c, sc in sorted(dt_scores.items(), key=lambda kv: kv[1], reverse=True)
-        if sc >= 0.30
-    ]
-    col_von = dt_sorted[0] if len(dt_sorted) >= 1 else None
-    col_bis = dt_sorted[1] if len(dt_sorted) >= 2 else None
-
-    # Raumspalte per Muster
-    room_pat = re.compile(
-        r"(^|\b)([A-ZÄÖÜ]{1,3}\s?\d{1,4}|\d{2,4}|[A-ZÄÖÜ]{1,2}\d{2,4})(\b|\s)"
-    )
-    room_scores = {
-        c: sample[c].astype(str).apply(lambda s: bool(room_pat.search(s))).mean()
-        for c in sample.columns
-    }
-    cand_room = [
-        c
-        for c, sc in sorted(room_scores.items(), key=lambda kv: kv[1], reverse=True)
-        if sc >= 0.30
-    ]
-    col_raum = (
-        cand_room[0]
-        if cand_room
-        else (
-            df.columns[6]
-            if len(df.columns) > 6
-            else (df.columns[3] if len(df.columns) > 3 else None)
-        )
-    )
-
-    # Standort/Adresse (heuristisch)
-    addr_pat = re.compile(
-        r"(strasse|str\.|platz|gasse|weg|allee|quai|ring|stras|platz)\b", re.I
-    )
-    site_scores = {
-        c: sample[c]
-        .astype(str)
-        .apply(lambda s: (" - " in s) or bool(addr_pat.search(s)))
-        .mean()
-        for c in sample.columns
-    }
-    cand_site = [
-        c
-        for c, sc in sorted(site_scores.items(), key=lambda kv: kv[1], reverse=True)
-        if sc >= 0.30
-    ]
-    col_site = cand_site[0] if cand_site else None
-    return col_von, col_bis, col_raum, col_site
-
-
-def normalize_to_room_times(df: pd.DataFrame) -> pd.DataFrame:
-    # Spaltennamen reinigen (klein, NBSP raus)
-    df = df.copy()
-    df.columns = [
-        str(c).replace("\u00a0", " ").replace("\u202f", " ").strip().lower()
-        for c in df.columns
-    ]
-
-    def try_parse_dt(x):
-        s = str(x)
-        s = s.replace("\u00a0", " ").replace("\u202f", " ").strip()
-        s = re.sub(r"^[A-Za-zÄÖÜäöüß]+\s*,\s*", "", s)
-        s = s.replace(" Uhr", "")
-        s = s.replace(",", " ")
-        s = re.sub(r"\s+", " ", s)
-        return pd.to_datetime(s, dayfirst=True, errors="coerce")
-
-    lower = {c: c for c in df.columns}
-
-    def find_col(keys):
+    def find_col(keys: List[str]) -> Optional[str]:
         for key in keys:
-            for lc in lower:
-                if key in lc:
-                    return lower[lc]
+            for col_lower, col_original in col_map.items():
+                if key in col_lower:
+                    return col_original
         return None
 
-    col_von = find_col(["von", "beginn", "start"]) or None
-    col_bis = find_col(["bis", "ende", "end"]) or None
-    col_raum = (
-        find_col(
-            [
-                "ressource bezeichnung",
-                "ressourcen id/bezeichnung",
-                "raum",
-                "ressource",
-                "resource",
-            ]
-        )
-        or None
+    col_aliases = {
+        "start": ["von", "beginn", "start", "startzeit", "datum von"],
+        "end": ["bis", "ende", "end", "endzeit", "datum bis"],
+        "room": ["ressource bezeichnung", "raum", "ressource", "resource"],
+        "location": [
+            "standortbezeichnung",
+            "adresse",
+            "standort",
+            "gebäude",
+            "gebaeude",
+        ],
+    }
+
+    col_start = find_col(col_aliases["start"]) or (
+        df.columns[0] if df.shape[1] > 0 else None
     )
-    col_site = (
-        find_col(["standortbezeichnung", "standort", "adresse", "strasse"]) or None
+    col_end = find_col(col_aliases["end"]) or (
+        df.columns[1] if df.shape[1] > 1 else None
     )
+    col_room = find_col(col_aliases["room"]) or (
+        df.columns[5]
+        if df.shape[1] > 5
+        else (df.columns[3] if df.shape[1] > 3 else None)
+    )
+    col_location = find_col(col_aliases["location"])
 
-    if not (col_von and col_bis and col_raum):
-        gv, gb, gr, gs = _guess_cols_by_content(df)
-        col_von = col_von or (gv.lower() if gv else None)
-        col_bis = col_bis or (gb.lower() if gb else None)
-        col_raum = col_raum or (gr.lower() if gr else None)
-        col_site = col_site or (gs.lower() if gs else None)
+    if not all([col_start, col_end, col_room]):
+        logging.warning("Could not find essential columns (start, end, room).")
+        return pd.DataFrame()
 
-    cols = list(df.columns)
-    if not col_von and len(cols) > 1:
-        col_von = cols[1]
-    if not col_bis and len(cols) > 2:
-        col_bis = cols[2]
-    if not col_raum and len(cols) > 6:
-        col_raum = cols[6]
-    if not col_site and len(cols) > 13:
-        col_site = cols[13]
+    def parse_datetime(series):
+        return pd.to_datetime(series, dayfirst=True, errors="coerce")
 
-    if not (col_von and col_bis and col_raum):
-        return pd.DataFrame(columns=["Von", "Bis", "Raum", "Standort", "Raumcode"])
-
-    out = pd.DataFrame(
+    clean_df = pd.DataFrame(
         {
-            "Von": df[col_von].apply(try_parse_dt),
-            "Bis": df[col_bis].apply(try_parse_dt),
-            "Raum": df[col_raum].astype(str),
-            "Standort": df[col_site].astype(str) if col_site else "",
+            "start_time": parse_datetime(df[col_start]),
+            "end_time": parse_datetime(df[col_end]),
+            "room_full": df[col_room].astype(str),
+            "location": df[col_location].astype(str) if col_location else "",
         }
     )
 
-    out = out[
-        pd.notna(out["Von"]) & pd.notna(out["Bis"]) & (out["Bis"] > out["Von"])
+    clean_df = clean_df.dropna(subset=["start_time", "end_time"])
+    clean_df = clean_df[clean_df["end_time"] > clean_df["start_time"]].copy()
+
+    if clean_df.empty:
+        return clean_df
+
+    for col in ["start_time", "end_time"]:
+        clean_df[col] = clean_df[col].dt.tz_localize(
+            Config.LOCAL_TIMEZONE, ambiguous="infer"
+        )
+
+    max_duration = timedelta(days=Config.SYNC_WINDOW_DAYS + 1)
+    clean_df = clean_df[clean_df["end_time"] - clean_df["start_time"] < max_duration]
+
+    start_win, end_win = get_sync_window()
+    clean_df = clean_df[
+        (clean_df["start_time"] <= end_win) & (clean_df["end_time"] >= start_win)
     ].copy()
-    if out.empty:
-        return out
 
-    out["Von"] = out["Von"].apply(
-        lambda x: (
-            x.tz_localize(LOCAL_TZ) if x.tzinfo is None else x.tz_convert(LOCAL_TZ)
-        )
-    )
-    out["Bis"] = out["Bis"].apply(
-        lambda x: (
-            x.tz_localize(LOCAL_TZ) if x.tzinfo is None else x.tz_convert(LOCAL_TZ)
-        )
-    )
-
-    start, end = compute_window_days_7()
-    inside = out[(out["Von"] <= end) & (out["Bis"] >= start)].copy()
-
-    if inside.empty:
-        try:
-            dmin = out["Von"].min()
-            dmax = out["Bis"].max()
-            print(
-                f"[NORM] Hinweis: Parsed date range = {dmin} .. {dmax} (keine Events im 7-Tage-Fenster)"
+    clean_df["room_code"] = clean_df["room_full"].apply(extract_room_code)
+    clean_df["fingerprint"] = clean_df.apply(
+        lambda row: hashlib.sha1(
+            f"{row['start_time'].isoformat()}|{row['end_time'].isoformat()}|{row['room_full']}|{row['location']}".encode(
+                "utf-8"
             )
-        except Exception:
-            pass
-        return inside
-
-    inside["Raumcode"] = inside["Raum"].apply(extract_room_code)
-    inside = inside.sort_values(["Von", "Raum"]).reset_index(drop=True)
-    return inside
-
-
-def chunk_to_days_6_22(df: pd.DataFrame) -> pd.DataFrame:
-    """Schneidet Events ins 7-Tage-Fenster und zerteilt mehrtaegige in Tages-Scheiben 06:00-22:00."""
-    if df.empty:
-        return df
-    start, end = compute_window_days_7()
-    rows = []
-    for _, r in df.iterrows():
-        st = max(r["Von"], start)
-        en = min(r["Bis"], end)
-        if en <= st:
-            continue
-        cur_day = pd.Timestamp(st.year, st.month, st.day, 0, 0, 0, tzinfo=LOCAL_TZ)
-        last_day = pd.Timestamp(en.year, en.month, en.day, 0, 0, 0, tzinfo=LOCAL_TZ)
-        while cur_day <= last_day:
-            d_start = pd.Timestamp(
-                cur_day.year, cur_day.month, cur_day.day, 6, 0, 0, tzinfo=LOCAL_TZ
-            )
-            d_end = pd.Timestamp(
-                cur_day.year, cur_day.month, cur_day.day, 22, 0, 0, tzinfo=LOCAL_TZ
-            )
-            s = max(st, d_start)
-            e = min(en, d_end)
-            if e > s:
-                nr = r.copy()
-                nr["Von"] = s
-                nr["Bis"] = e
-                rows.append(nr)
-            cur_day = cur_day + pd.Timedelta(days=1)
-    if not rows:
-        return df.iloc[0:0].copy()
-    out = pd.DataFrame(rows)
-    return out.sort_values(["Von", "Raum"]).reset_index(drop=True)
-
-
-# ------------------ HTML-Tafel ------------------
-
-
-def export_html_timeline(df: pd.DataFrame, dest: Path) -> None:
-    if df.empty:
-        dest.write_text("<html><body>Keine Daten</body></html>", encoding="utf-8")
-        print(f"[HTML] Tafel: {dest}")
-        return
-    start, end = compute_window_days_7()
-    days = [start + pd.Timedelta(days=i) for i in range(7)]
-
-    rooms = (
-        df[["Raumcode", "Raum"]]
-        .assign(_key=df["Raumcode"].fillna("") + "|" + df["Raum"].fillna(""))
-        .drop_duplicates(subset="_key")
+        ).hexdigest(),
+        axis=1,
     )
-    room_order = (
-        rooms["Raumcode"].replace("", pd.NA).fillna(rooms["Raum"]).fillna("").tolist()
-    )
+    return clean_df.sort_values(["start_time", "room_code"]).reset_index(drop=True)
 
-    by_room: Dict[str, List[pd.Series]] = {r: [] for r in room_order}
-    for _, row in df.iterrows():
-        rc = str(row["Raumcode"] or row["Raum"] or "")
-        by_room.setdefault(rc, []).append(row)
 
-    css = """
-    <style>
-      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;margin:16px}
-      .grid{display:grid;grid-template-columns:200px repeat(7,1fr);gap:8px}
-      .h{font-weight:600;background:#f4f6f8;padding:8px;border:1px solid #e5e7eb;border-radius:8px;text-align:center}
-      .r{background:#fff;padding:8px;border:1px solid #e5e7eb;border-radius:8px}
-      .cell{position:relative;height:60px;background:#fafafa;border:1px dashed #e5e7eb;border-radius:8px;overflow:hidden}
-      .bar{position:absolute;left:0;right:0;height:22px;margin:2px;border-radius:6px;background:#7c3aed;opacity:.85;color:#fff;font-size:12px;line-height:22px;padding:0 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    </style>
-    """
-    html = [
-        "<html><head><meta charset='utf-8'>",
-        css,
-        "</head><body>",
-        f"<h2>Belegungen {start.strftime('%d.%m.%Y')} - {end.strftime('%d.%m.%Y')}</h2>",
-        "<div class='grid'>",
-        "<div class='h'>Raum</div>",
-    ]
-    for d in days:
-        html.append(f"<div class='h'>{d.strftime('%a %d.%m')}</div>")
-    for room in room_order:
-        html.append(f"<div class='r'><div><b>{room}</b></div></div>")
-        for d in days:
-            html.append("<div class='cell'>")
-            day_start = pd.Timestamp(d.year, d.month, d.day, 6, 0, 0, tzinfo=LOCAL_TZ)
-            day_end = pd.Timestamp(d.year, d.month, d.day, 22, 0, 0, tzinfo=LOCAL_TZ)
-            total = (day_end - day_start).total_seconds()
-            for r in by_room.get(room, []):
-                st = r["Von"].tz_convert(LOCAL_TZ)
-                en = r["Bis"].tz_convert(LOCAL_TZ)
-                if st.date() > d.date() or en.date() < d.date():
-                    continue
-                s = max(st, day_start)
-                e = min(en, day_end)
-                if e <= s:
-                    continue
-                left = (s - day_start).total_seconds() / total * 100.0
-                width = (e - s).total_seconds() / total * 100.0
-                label = f"{s.strftime('%H:%M')} - {e.strftime('%H:%M')}"
-                html.append(
-                    f"<div class='bar' style='left:{left:.2f}%;width:{width:.2f}%' title='{label}'>{label}</div>"
+# ------------------ GOOGLE CALENDAR API ------------------
+# ERSETZE DIE GESAMTE GCalManager-KLASSE MIT DIESEM CODE
+
+
+class GCalManager:
+    """Handles all interactions with the Google Calendar API using a delta-sync approach."""
+
+    def __init__(self):
+        self.service = self._get_service()
+
+    @staticmethod
+    def _get_service():
+        creds = None
+        if Config.TOKEN_FILE.exists():
+            creds = Credentials.from_authorized_user_file(
+                str(Config.TOKEN_FILE), Config.GCAL_SCOPES
+            )
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    Config.CREDENTIALS_FILE, Config.GCAL_SCOPES
                 )
-            html.append("</div>")
-    html.append("</div></body></html>")
-    dest.write_text("".join(html), encoding="utf-8")
-    print(f"[HTML] Tafel: {dest}")
+                creds = flow.run_local_server(port=0)
+            Config.TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+        return build("calendar", "v3", credentials=creds)
 
+    def get_or_create_calendar(self, calendar_name: str) -> str:
+        page_token = None
+        while True:
+            cal_list = self.service.calendarList().list(pageToken=page_token).execute()
+            for item in cal_list.get("items", []):
+                if item["summary"] == calendar_name:
+                    logging.info(
+                        f"Found existing calendar '{calendar_name}' (ID: {item['id']})"
+                    )
+                    return item["id"]
+            page_token = cal_list.get("nextPageToken")
+            if not page_token:
+                break
 
-# ------------------ Google Calendar ------------------
+        logging.info(f"Creating new calendar: '{calendar_name}'")
+        new_cal = {"summary": calendar_name, "timeZone": Config.LOCAL_TIMEZONE_NAME}
+        created_cal = self.service.calendars().insert(body=new_cal).execute()
+        return created_cal["id"]
 
+    def get_synced_events(self, calendar_id: str) -> Dict[str, str]:
+        """Fetches existing synced events and returns a map of {fingerprint: event_id}."""
+        now_utc = pd.Timestamp.now(tz="UTC")
+        max_utc = now_utc + timedelta(days=Config.GCAL_DELETE_HORIZON_DAYS)
 
-def load_gcal_service():
-    creds = None
-    tp = SCRIPT_DIR / "token.json"
-    if tp.exists():
-        creds = Credentials.from_authorized_user_file(str(tp), SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(SCRIPT_DIR / "credentials.json"), SCOPES
+        existing_events = {}
+        page_token = None
+        while True:
+            events_result = (
+                self.service.events()
+                .list(
+                    calendarId=calendar_id,
+                    timeMin=now_utc.isoformat(),
+                    timeMax=max_utc.isoformat(),
+                    singleEvents=True,
+                    maxResults=2500,
+                    pageToken=page_token,
+                )
+                .execute()
             )
-            creds = flow.run_local_server(port=0)
-        tp.write_text(creds.to_json(), encoding="utf-8")
-    return build("calendar", "v3", credentials=creds)
 
+            for event in events_result.get("items", []):
+                props = event.get("extendedProperties", {}).get("private", {})
+                if props.get("source") == Config.GCAL_SOURCE_TAG and "fp" in props:
+                    existing_events[props["fp"]] = event["id"]
 
-def get_or_create_calendar(service, calendar_name: str) -> str:
-    page_token = None
-    while True:
-        resp = (
-            service.calendarList().list(pageToken=page_token, maxResults=250).execute()
-        )
-        for item in resp.get("items", []):
-            if item.get("summary") == calendar_name:
-                return item["id"]
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    created = (
-        service.calendars()
-        .insert(body={"summary": calendar_name, "timeZone": "Europe/Zurich"})
-        .execute()
-    )
-    return created["id"]
+            page_token = events_result.get("nextPageToken")
+            if not page_token:
+                break
 
+        logging.info(f"Found {len(existing_events)} existing events in calendar.")
+        return existing_events
 
-def rfc3339_utc(ts: pd.Timestamp) -> str:
-    if ts.tzinfo is None:
-        ts = ts.tz_localize(LOCAL_TZ)
-    return ts.tz_convert("UTC").isoformat().replace("+00:00", "Z")
+    @staticmethod
+    def _create_event_body(row: pd.Series) -> Dict[str, Any]:
+        summary_parts = ["Belegt", row.get("room_code", "").strip()]
+        location_parts = [row.get("room_full", "").strip()]
 
+        if location := row.get("location", "").strip():
+            summary_parts.append(location)
+            location_parts.append(location)
 
-def fingerprint(row) -> str:
-    base = f"{row['Von'].isoformat()}|{row['Bis'].isoformat()}|{row.get('Raum','')}|{row.get('Standort','')}"
-    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+        summary = " – ".join(filter(None, summary_parts))
+        location_str = " | ".join(filter(None, location_parts))
 
-
-def delete_future_own_events(service, calendar_id: str, horizon_days: int = 8) -> None:
-    now_utc = pd.Timestamp.now(tz="UTC").isoformat()
-    max_utc = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=horizon_days)).isoformat()
-    to_delete = []
-    page_token = None
-    while True:
-        resp = (
-            service.events()
-            .list(
-                calendarId=calendar_id,
-                timeMin=now_utc,
-                timeMax=max_utc,
-                singleEvents=True,
-                maxResults=2500,
-                pageToken=page_token,
-            )
-            .execute()
-        )
-        for ev in resp.get("items", []):
-            props = ev.get("extendedProperties", {}).get("private", {})
-            if props.get("source") == SOURCE_TAG:
-                to_delete.append(ev["id"])
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    for eid in to_delete:
-        service.events().delete(
-            calendarId=calendar_id, eventId=eid, sendUpdates="none"
-        ).execute()
-    if to_delete:
-        print(f"[GCAL] Alte Events geloescht: {len(to_delete)}")
-
-
-def push_events(service, calendar_id: str, df: pd.DataFrame) -> None:
-    if df.empty:
-        print("[GCAL] Keine Events zu pushen.")
-        return
-    inserted = 0
-    for _, r in df.iterrows():
-        parts = ["Belegt"]
-        rc = str(r.get("Raumcode") or "").strip()
-        st = str(r.get("Standort") or "").strip()
-        if rc:
-            parts.append(rc)
-        if st:
-            parts.append(st)
-        summary = " - ".join(parts)
-        loc = str(r.get("Raum") or "")
-        loc = f"{loc} | {st}" if st and loc else (st or loc)
-        body = {
+        return {
             "summary": summary,
-            "location": loc,
-            "start": {"dateTime": rfc3339_utc(r["Von"]), "timeZone": "UTC"},
-            "end": {"dateTime": rfc3339_utc(r["Bis"]), "timeZone": "UTC"},
+            "location": location_str,
+            "start": {
+                "dateTime": row["start_time"].isoformat(),
+                "timeZone": Config.LOCAL_TIMEZONE_NAME,
+            },
+            "end": {
+                "dateTime": row["end_time"].isoformat(),
+                "timeZone": Config.LOCAL_TIMEZONE_NAME,
+            },
             "visibility": "private",
             "transparency": "opaque",
             "extendedProperties": {
-                "private": {"source": SOURCE_TAG, "fp": fingerprint(r)}
+                "private": {"source": Config.GCAL_SOURCE_TAG, "fp": row["fingerprint"]}
             },
         }
-        service.events().insert(
-            calendarId=calendar_id, body=body, sendUpdates="none"
-        ).execute()
-        inserted += 1
-    print(f"[GCAL] Eingetragen: {inserted} Events")
 
+    def _execute_batch(self, requests: List[Dict], progress_desc: str):
+        if not requests:
+            return 0, 0
 
-def _bucket_from_standort(standort: str, mode: str) -> str:
-    s = (standort or "").strip()
-    if not s:
-        return "Unbekannt"
-    if mode == "gebaeude":
-        return s.split(" - ")[0].strip() or "Unbekannt"
-    return s
+        success_count = 0
 
+        def callback(request_id, response, exception):
+            nonlocal success_count
+            if not exception:
+                success_count += 1
 
-def _calendar_name_for_bucket(base_name: str, bucket: str) -> str:
-    name = f"{base_name} - {bucket.strip()}"
-    return name[:80]
+        with tqdm(total=len(requests), desc=progress_desc) as pbar:
+            for i in range(0, len(requests), Config.GCAL_BATCH_CHUNK_SIZE):
+                chunk = requests[i : i + Config.GCAL_BATCH_CHUNK_SIZE]
+                batch = self.service.new_batch_http_request()
+                for req in chunk:
+                    batch.add(req, callback=callback)
 
+                batch.execute()
+                pbar.update(len(chunk))
 
-def group_and_push_by_calendar(
-    service, base_calendar_name: str, df: pd.DataFrame, split_by: str
-) -> None:
-    if df.empty:
-        print("[GCAL] Keine Events zu pushen.")
-        return
-    if split_by == "none":
-        cal_id = get_or_create_calendar(service, base_calendar_name)
-        delete_future_own_events(service, cal_id, horizon_days=8)
-        push_events(service, cal_id, df)
-        return
-    mode = "standort" if split_by == "standort" else "gebaeude"
-    work = df.copy()
-    work["__bucket"] = work["Standort"].apply(lambda s: _bucket_from_standort(s, mode))
-    for bucket, part in work.groupby("__bucket", dropna=False):
-        cal_name = _calendar_name_for_bucket(base_calendar_name, str(bucket))
-        cal_id = get_or_create_calendar(service, cal_name)
-        delete_future_own_events(service, cal_id, horizon_days=8)
-        push_events(service, cal_id, part.drop(columns=["__bucket"], errors="ignore"))
+                if i + Config.GCAL_BATCH_CHUNK_SIZE < len(requests):
+                    time.sleep(1)
 
+        failure_count = len(requests) - success_count
+        return success_count, failure_count
 
-# ------------------ Login & Filter & Grid ------------------
-
-
-def send_alert_email(subject: str, body: str, to_addr: Optional[str] = None) -> None:
-    host = os.getenv("SMTP_HOST", "smtp.office365.com")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    user = os.getenv("SMTP_USER", "")
-    pwd = os.getenv("SMTP_PASS", "")
-    from_addr = os.getenv("SMTP_FROM", user or "no-reply@localhost")
-    to_addr = to_addr or os.getenv("ALERT_TO", "gec5@bfh.ch")
-
-    if not user or not pwd:
-        print("[ALERT] SMTP_USER/SMTP_PASS fehlen – keine Mail gesendet.")
-        return
-
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = from_addr
-    msg["To"] = to_addr
-    msg.set_content(body)
-
-    try:
-        with smtplib.SMTP(host, port) as s:
-            s.ehlo()
-            s.starttls(context=ssl.create_default_context())
-            s.login(user, pwd)
-            s.send_message(msg)
-        print(f"[ALERT] Mail gesendet an {to_addr}")
-    except Exception as e:
-        print(f"[ALERT] Mailversand fehlgeschlagen: {e}")
-
-
-async def ensure_logged_in(page: Page, timeout_ms: int) -> bool:
-    """Auto-Login (AzureAD & klassische Form) ueber ROOMS_USER/ROOMS_PASS. Nutzt persistentes Profil."""
-    user = os.getenv("ROOMS_USER") or ""
-    pw = os.getenv("ROOMS_PASS") or ""
-
-    # schon eingeloggt?
-    try:
-        if await page.locator(
-            "a:has-text('Abmelden'), a:has-text('Logout'), a:has-text('Profil')"
-        ).first.is_visible():
-            return True
-    except Exception:
-        pass
-
-    await page.wait_for_timeout(800)
-
-    # Azure AD
-    try:
-        if await page.locator("#i0116").is_visible():  # E-Mail
-            if user:
-                await page.fill("#i0116", user)
-                await page.click("#idSIButton9")
-                await page.wait_for_timeout(600)
-        if await page.locator("#i0118").is_visible():  # Passwort
-            if pw:
-                await page.fill("#i0118", pw)
-                await page.click("#idSIButton9")
-                await page.wait_for_timeout(1200)
-        if await page.locator(
-            "#KmsiCheckbox, input[name='DontShowAgain']"
-        ).first.is_visible():
-            try:
-                await page.check("#KmsiCheckbox")
-            except Exception:
-                pass
-            for sel in [
-                "#idSIButton9",
-                "button:has-text('Ja')",
-                "input[type='submit']:has-text('Ja')",
-            ]:
-                try:
-                    if await page.locator(sel).is_visible():
-                        await page.click(sel)
-                        await page.wait_for_timeout(600)
-                        break
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    # Klassische Form
-    try:
-        user_sel = "input[name='username'], input[type='email'], input[name='UserName']"
-        pass_sel = "input[type='password'], input[name='Password']"
-        if await page.locator(user_sel).first.is_visible():
-            if user:
-                await page.fill(user_sel, user)
-            if await page.locator(pass_sel).first.is_visible() and pw:
-                await page.fill(pass_sel, pw)
-            for sel in [
-                "button[type='submit']",
-                "button:has-text('Anmelden')",
-                "input[type='submit']",
-            ]:
-                try:
-                    if await page.locator(sel).first.is_visible():
-                        await page.click(sel)
-                        break
-                except Exception:
-                    pass
-            await page.wait_for_timeout(1000)
-    except Exception:
-        pass
-
-    # zurueck zur Zielliste
-    try:
-        await page.goto(URL_FIND, wait_until="domcontentloaded")
-    except Exception:
-        pass
-
-    # finaler Login-Check
-    try:
-        if await page.locator(
-            "a:has-text('Abmelden'), a:has-text('Logout'), a:has-text('Profil')"
-        ).first.is_visible():
-            return True
-    except Exception:
-        pass
-    return False
-
-
-async def wait_for_results_frame(page: Page, timeout_ms: int) -> Frame:
-    sel_candidates = [
-        "div.k-grid-content table tbody tr",
-        "div.k-grid-content table tr",
-        "#contentgrid table tbody tr",
-        "table.k-selectable tbody tr",
-        "table tbody tr",
-    ]
-    for sel in sel_candidates:
-        try:
-            await page.wait_for_selector(
-                sel, timeout=min(4000, timeout_ms), state="visible"
-            )
-            return page.main_frame
-        except Exception:
-            pass
-    for fr in page.frames:
-        for sel in sel_candidates:
-            try:
-                await fr.wait_for_selector(sel, timeout=2000, state="visible")
-                return fr
-            except Exception:
-                continue
-    return page.main_frame
-
-
-async def extract_kendo_grid(frame: Frame) -> pd.DataFrame:
-    headers = await frame.eval_on_selector_all(
-        "div.k-grid-header thead tr th", "els => els.map(th => th.innerText.trim())"
-    )
-    rows = await frame.eval_on_selector_all(
-        "div.k-grid-content table tbody tr",
-        "els => els.map(tr => Array.from(tr.children).map(td => td.innerText.trim()))",
-    )
-    if not rows:
-        rows = await frame.eval_on_selector_all(
-            "table tbody tr",
-            "els => els.map(tr => Array.from(tr.children).map(td => td.innerText.trim()))",
-        )
-    if not rows:
-        return pd.DataFrame()
-    if not headers:
-        maxlen = max(len(r) for r in rows)
-        headers = [str(i) for i in range(maxlen)]
-    width = len(headers)
-    norm_rows = [
-        r + [""] * (width - len(r)) if len(r) < width else r[:width] for r in rows
-    ]
-    return pd.DataFrame(norm_rows, columns=headers)
-
-
-async def kendo_click_next(frame: Frame) -> bool:
-    sels = [
-        "a[aria-label*='next' i]",
-        "a[title*='Weiter' i]",
-        "a[title*='Naechste' i]",
-        "a.k-pager-next",
-        "a.k-link.k-pager-next",
-        "button.k-pager-next",
-    ]
-    for sel in sels:
-        try:
-            el = await frame.wait_for_selector(sel, timeout=800)
-            if not el:
-                continue
-            disabled = await el.get_attribute("aria-disabled")
-            cls = (await el.get_attribute("class")) or ""
-            if disabled == "true" or "k-disabled" in cls or "k-state-disabled" in cls:
-                return False
-            await el.click()
-            return True
-        except Exception:
-            continue
-    return False
-
-
-async def try_set_page_size(frame: Frame, target: int = 200) -> None:
-    try:
-        sel = await frame.query_selector("select.k-pager-sizes")
-        if sel:
-            try:
-                await sel.select_option(str(target))
-                return
-            except Exception:
-                pass
-    except Exception:
-        pass
-    try:
-        dd = await frame.query_selector(
-            ".k-pager-sizes .k-dropdown, .k-pager-sizes .k-combobox"
-        )
-        if dd:
-            await dd.click()
-            opt = await frame.wait_for_selector(
-                f".k-list .k-item:has-text('{target}')", timeout=1200
-            )
-            if opt:
-                await opt.click()
-    except Exception:
-        pass
-
-
-async def collect_all_pages(
-    page: Page, timeout_ms: int, max_pages: int = 200
-) -> pd.DataFrame:
-    frame = await wait_for_results_frame(page, timeout_ms)
-    await try_set_page_size(frame, 200)
-    await page.wait_for_timeout(600)
-    all_dfs: List[pd.DataFrame] = []
-    seen_first_row: set[str] = set()
-    for _ in range(max_pages):
-        dfp = await extract_kendo_grid(frame)
-        if dfp is None or dfp.empty:
-            break
-        try:
-            first_row = "|".join(map(str, dfp.iloc[0].tolist()))
-        except Exception:
-            first_row = f"len={len(dfp)}"
-        if first_row in seen_first_row:
-            break
-        seen_first_row.add(first_row)
-        all_dfs.append(dfp)
-        clicked = await kendo_click_next(frame)
-        if not clicked:
-            break
-        await page.wait_for_timeout(600)
-    if not all_dfs:
-        return pd.DataFrame()
-    raw = pd.concat(all_dfs, ignore_index=True).drop_duplicates()
-    return raw
-
-
-async def verify_window_matches(page: Page, timeout_ms: int) -> bool:
-    try:
-        frame = await wait_for_results_frame(page, timeout_ms)
-        df = await extract_kendo_grid(frame)
-        if df is None or df.empty:
-            return False
-        lower = {str(c).lower(): c for c in df.columns}
-        col_von = next(
-            (
-                lower[k]
-                for k in lower
-                if ("von" in k) or ("beginn" in k) or ("start" in k)
-            ),
-            None,
-        )
-        col_bis = next(
-            (lower[k] for k in lower if ("bis" in k) or ("ende" in k) or ("end" in k)),
-            None,
-        )
-        if not (col_von and col_bis):
-            return False
-
-        def pdt(x):
-            s = str(x).strip().replace(",", " ")
-            return pd.to_datetime(s, dayfirst=True, errors="coerce")
-
-        probe = df.head(60).copy()
-        probe["__v"] = probe[col_von].apply(pdt)
-        probe["__b"] = probe[col_bis].apply(pdt)
-        probe = probe[pd.notna(probe["__v"]) & pd.notna(probe["__b"])]
-        if probe.empty:
-            return False
-        start, end = compute_window_days_7()
-        ratio = ((probe["__b"] >= start) & (probe["__v"] <= end)).mean()
-        return bool(ratio >= 0.6)
-    except Exception:
-        return False
-
-
-async def ensure_window_or_retry(
-    page: Page, timeout_ms: int, attempts: int = 3
-) -> bool:
-    ok = False
-    for i in range(attempts):
-        von_ok, bis_ok, searched, tag = await apply_7day_filter_and_search(page)
-        print(
-            f"Filter gesetzt (Try {i+1}/{attempts}): Von={von_ok} Bis={bis_ok} | Suche ausgeloest={searched} | {tag}"
-        )
-        await page.wait_for_timeout(1200)
-        if await verify_window_matches(page, timeout_ms):
-            ok = True
-            print("[FILTER] Zeitfenster verifiziert.")
-            break
-        try:
-            btn_reset = page.locator(
-                "button:has-text('Zuruecksetzen'), button:has-text('Zurücksetzen'), button:has-text('Reset')"
-            ).first
-            if await btn_reset.is_visible():
-                await btn_reset.click()
-        except Exception:
-            pass
-    if not ok:
-        print(
-            "[FILTER] Zeitfenster nicht sicher - fahre mit Grid-Scraping fort (lokale Filterung heute->+7)."
-        )
-    return ok
-
-
-async def apply_7day_filter_and_search(page: Page) -> Tuple[bool, bool, bool, str]:
-    """Setzt Datum/Zeit (heute -> +7, 06:00-22:00), deaktiviert 'Heute...' und klickt Finden via JS."""
-    start, end = compute_window_days_7()
-    try:
-        res = await page.evaluate(
-            """(arg) => {
-                const { sDate, eDate } = arg;
-                const fmt = (iso) => {
-                  const d = new Date(iso);
-                  const dd = String(d.getDate()).padStart(2,'0');
-                  const mm = String(d.getMonth()+1).padStart(2,'0');
-                  const yyyy = d.getFullYear();
-                  return `${dd}.${mm}.${yyyy}`;
-                };
-                const valVon = fmt(sDate), valBis = fmt(eDate);
-
-                const manual = document.querySelector('#ReservationFilter_ManualDateTimeSelection');
-                if (manual && !manual.checked){ manual.checked=true; manual.dispatchEvent(new Event('change',{bubbles:true})); }
-
-                const alt = document.querySelector('#ReservationFilter_Reservationszeitpunkt');
-                let untoggled=false; if (alt && alt.value!=='0'){ alt.value='0'; alt.dispatchEvent(new Event('change',{bubbles:true})); untoggled=true; }
-
-                const setVal=(sel,val)=>{ const el=document.querySelector(sel); if(!el) return false; el.removeAttribute('readonly'); el.value=val; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return true; };
-                let vonOk=setVal('#dtpReservationDateFrom', valVon);
-                let bisOk=setVal('#dtpReservationDateTo', valBis);
-                setVal('#dtpReservationTimeFrom','06:00');
-                setVal('#dtpReservationTimeTo','22:00');
-
-                let searched=false;
-                const btn = Array.from(document.querySelectorAll('button,input[type="button"],input[type="submit"]'))
-                                  .find(b=>/finden|suchen/i.test((b.textContent||b.value||'')));
-                if(btn){ btn.click(); searched=true; }
-                return {vonOk,bisOk,searched,untoggled};
-            }""",
-            {"sDate": start.isoformat(), "eDate": end.isoformat()},
-        )
-        return (
-            bool(res["vonOk"]),
-            bool(res["bisOk"]),
-            bool(res["searched"]),
-            ("untoggled" if res.get("untoggled") else "no-alt"),
-        )
-    except Exception as e:
-        return False, False, False, f"err={e}"
-
-
-async def force_find(page: Page, timeout_ms: int) -> None:
-    # Popups schliessen (Kalender)
-    for _ in range(3):
-        try:
-            await page.keyboard.press("Escape")
-            await page.wait_for_timeout(120)
-        except Exception:
-            pass
-    try:
-        await page.click("body", position={"x": 10, "y": 10})
-    except Exception:
-        pass
-
-    # Vorherige erste Tabellenzeile merken
-    before = ""
-    try:
-        frame = await wait_for_results_frame(page, timeout_ms)
-        df = await extract_kendo_grid(frame)
-        if df is not None and not df.empty:
-            before = "|".join(map(str, df.iloc[0].tolist()))
-    except Exception:
-        pass
-
-    # "Finden" wirklich klicken
-    selectors = [
-        "button:has-text('Finden')",
-        "input[type='submit'][value*='Finden' i]",
-        "#btnFind",
-        "button[name*='Find' i]",
-    ]
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if await loc.is_visible():
-                await loc.click()
-                break
-        except Exception:
-            continue
-
-    # Auf Grid-Update warten
-    try:
-        frame = await wait_for_results_frame(page, timeout_ms)
-
-        async def grid_changed() -> bool:
-            d2 = await extract_kendo_grid(frame)
-            if d2 is None or d2.empty:
-                return False
-            now = "|".join(map(str, d2.iloc[0].tolist()))
-            return now != before
-
-        for _ in range(40):  # ~12s
-            if await grid_changed():
-                return
-            await page.wait_for_timeout(300)
-    except Exception:
-        pass
-
-
-# ------------------ Export-Logik ------------------
-
-
-async def _list_messagecenter_reports(page: Page) -> List[str]:
-    """Sucht in den Message-/Toast-APIs nach dem CSV-Link, falls kein sichtbarer Link im DOM auftaucht."""
-    try:
-        msg_url = await page.eval_on_selector(
-            ".notification-container.ui-notify",
-            "el => el.getAttribute('data-messageurl')",
-        )
-    except Exception:
-        msg_url = None
-
-    if not msg_url:
-        msg_url = "/Default/Lists/Environment/GetMessageCenterNotifications"
-    if not msg_url.startswith("http"):
-        msg_url = BASE + msg_url
-
-    try:
-        resp = await page.context.request.get(msg_url)
-        if not resp.ok:
-            return []
-        txt = await resp.text()
-    except Exception:
-        return []
-
-    links: List[str] = []
-    try:
-        data = json.loads(txt)
-    except Exception:
-        data = [txt]
-
-    def _abs(href: str) -> str:
-        return href if href.startswith("http") else BASE + href
-
-    if isinstance(data, dict):
-        data = data.get("data") or data.get("items") or data.get("Messages") or []
-
-    if isinstance(data, list):
-        for m in data:
-            html = (
-                str(m.get("Message") or m.get("message") or m)
-                if isinstance(m, dict)
-                else str(m)
-            )
-            m_href = re.search(r"href=['\"]([^'\"]+)['\"]", html, re.I)
-            if m_href:
-                href = _abs(m_href.group(1))
-                if "/Default/Reports/Environment/Report/" in href:
-                    links.append(href)
-    return links
-
-
-async def _pick_latest_rooms_csv(
-    click_epoch_secs: float, downloads_dir: Path
-) -> Optional[Path]:
-    """Nimmt die juengste CSV seit Klickzeitpunkt aus dem Downloads-Ordner und kopiert sie in ARTIFACTS_DIR."""
-    if not downloads_dir.exists():
-        return None
-
-    candidates: List[tuple[float, Path]] = []
-    # bevorzugt nach Namensmuster
-    for p in downloads_dir.glob("*.csv"):
-        try:
-            mtime = os.path.getmtime(p)
-        except Exception:
-            continue
-        if mtime >= click_epoch_secs and ROOMS_CSV_PATTERN.search(p.name):
-            candidates.append((mtime, p))
-
-    # ansonsten jede neue *.csv
-    if not candidates:
-        for p in downloads_dir.glob("*.csv"):
-            try:
-                mtime = os.path.getmtime(p)
-            except Exception:
-                continue
-            if mtime >= click_epoch_secs:
-                candidates.append((mtime, p))
-
-    if not candidates:
-        return None
-
-    candidates.sort(reverse=True)
-    latest = candidates[0][1]
-    dest = ARTIFACTS_DIR / latest.name
-    dest.write_bytes(latest.read_bytes())
-    print(f"[EXPORT] Datei aus Downloads uebernommen: {latest} -> {dest}")
-    return dest
-
-
-async def click_export_and_download(
-    page: Page, timeout_ms: int, downloads_dir: Path
-) -> Optional[Path]:
-    """
-    Klickt Export, wartet auf Toast/Messagecenter-Link, versucht direkten Download
-    und faellt ggf. auf den Downloads-Ordner zurueck.
-    """
-    try:
-        # Export-Button finden
-        sel_variants = [
-            "img[title='Export']",
-            "img[alt='Export']",
-            "#contentgrid .fa-file-excel",
-            "#contentgrid i.k-i-excel",
-            "button:has-text('Export')",
-            "a[title*='Export' i]",
-        ]
-        btn = None
-        for sel in sel_variants:
-            try:
-                cand = await page.wait_for_selector(sel, timeout=5000, state="visible")
-                if cand:
-                    btn = cand
-                    break
-            except Exception:
-                continue
-
-        if not btn:
-            print("[EXPORT] Kein Export-Button sichtbar – Fallback via Grid.")
-            return None
-
-        click_epoch_secs = time.time()
-        await btn.click()
-        print("[EXPORT] Export-Icon geklickt - warte auf CSV-Link...")
-
-        toast_href = None
-        start_ts = time.time()
-        last_log = 0
-
-        # 1) Direkt nach Toast/Link suchen (max ~120s)
-        while time.time() - start_ts < min(timeout_ms / 1000, 120):
-            # Link im Toast
-            loc = page.locator(".notification-container .ui-notify-message a")
-            try:
-                n = await loc.count()
-            except Exception:
-                n = 0
-            if n:
-                for i in range(n - 1, -1, -1):
-                    a = loc.nth(i)
-                    try:
-                        if await a.is_visible():
-                            text = (await a.inner_text()).strip().lower()
-                            if text.endswith(".csv"):
-                                toast_href = await a.get_attribute("href")
-                                break
-                    except Exception:
-                        pass
-
-            # alternativ Messagecenter-API
-            if not toast_href:
-                links = await _list_messagecenter_reports(page)
-                if links:
-                    toast_href = links[-1]
-
-            # Download versuchen
-            if toast_href:
-                try:
-                    async with page.expect_download(timeout=timeout_ms) as dl_info:
-                        await page.evaluate(
-                            "(h)=>{ const a=document.createElement('a'); a.href=h; a.target='_self'; document.body.appendChild(a); a.click(); a.remove(); }",
-                            toast_href,
-                        )
-                    download = await dl_info.value
-                    dest = ARTIFACTS_DIR / download.suggested_filename
-                    await download.save_as(dest)
-                    print(f"[EXPORT] Datei gespeichert: {dest}")
-                    return dest
-                except Exception as e:
-                    print(f"[EXPORT] Download ueber Link fehlgeschlagen: {e}")
-                    toast_href = None  # erneut suchen
-
-            waited = int(time.time() - start_ts)
-            if waited - last_log >= 15:
-                print(f"[EXPORT] ...warte weiterhin auf Export (ca. {waited}s)")
-                last_log = waited
-            await asyncio.sleep(0.5)
-
-        # 2) Fallback: Beobachte Downloads-Ordner bis Timeout
-        print("[EXPORT] Kein Link - pruefe Downloads-Ordner...")
-        waited = 0
-        last_log = 0
-        while waited < timeout_ms / 1000:
-            dest = await _pick_latest_rooms_csv(click_epoch_secs, downloads_dir)
-            if dest:
-                return dest
-            await asyncio.sleep(1)
-            waited += 1
-            if waited - last_log >= 15:
-                print(f"[EXPORT] ...warte weiterhin auf Export (ca. {waited}s)")
-                last_log = waited
-
-        print("[EXPORT] Keine neue CSV im Downloads-Ordner gefunden.")
-        return None
-
-    except Exception as e:
-        print(f"[EXPORT] Export nicht moeglich: {e} – Fallback via Grid.")
-        return None
-
-
-# ------------------ Main ------------------
-
-
-async def run(
-    timeout_ms: int,
-    calendar: str,
-    downloads_override: Optional[str],
-    split_by: str,
-    chunk: bool,
-    prefer_grid: bool,
-) -> None:
-    downloads_dir = (
-        Path(downloads_override) if downloads_override else (Path.home() / "Downloads")
-    )
-    start, end = compute_window_days_7()
-    print(
-        f"Zeitraum: {start.strftime('%d.%m.%Y %H:%M')} -> {end.strftime('%d.%m.%Y %H:%M')}"
-    )
-
-    async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(USER_DATA_DIR),
-            headless=False,
-            accept_downloads=True,
-        )
-        page = await context.new_page()
-        await page.goto(URL_FIND, wait_until="domcontentloaded")
-        try:
-            await page.wait_for_load_state(
-                "networkidle", timeout=min(timeout_ms, 10000)
-            )
-        except PWTimeoutError:
-            pass
-
-        # Auto-Login
-        logged_in = await ensure_logged_in(page, timeout_ms)
-        if not logged_in:
-            ts = pd.Timestamp.now(tz=LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
-            send_alert_email(
-                subject="BFH Rooms Sync: Login fehlgeschlagen",
-                body=f"Automatischer Login ist fehlgeschlagen ({ts}). Bitte pruefen.",
-                to_addr=os.getenv("ALERT_TO", "gec5@bfh.ch"),
-            )
-            print("[LOGIN] Fehlgeschlagen - Abbruch.")
-            await context.close()
+    def sync_events(self, base_calendar_name: str, df: pd.DataFrame, split_by: str):
+        if df.empty:
+            logging.warning("No events to sync.")
             return
 
-        try:
-            await page.wait_for_load_state("networkidle", timeout=4000)
-        except Exception:
-            pass
+        if split_by == "none":
+            groups = {base_calendar_name: df}
+        else:
+            # NEU: Übersetzungsliste für Standorte
+            location_name_map = {
+                "BFH-H-Gebäude Schwarztor": "Schwarztorstrasse 48",
+                # Hier können bei Bedarf weitere Übersetzungen hinzugefügt werden
+                # "Kryptischer Name aus CSV": "Schöner Name für Kalender",
+            }
 
-        # Filter setzen
-        von_ok, bis_ok, searched, info = await apply_7day_filter_and_search(page)
-        print(f"[FILTER] JS: vonOk={von_ok} bisOk={bis_ok} searched={searched} {info}")
+            def get_bucket(location: str) -> str:
+                s = (location or "").strip() or "Unbekannt"
+                # Zuerst prüfen, ob es eine Übersetzung gibt
+                if s in location_name_map:
+                    return location_name_map[s]
+                # Fallback auf die bisherige Logik
+                return s.split(" - ")[0].strip() if split_by == "gebaeude" else s
 
-        # Popups schliessen und Finden erzwingen
-        await force_find(page, timeout_ms)
+            df["__bucket"] = df["location"].apply(get_bucket)
+            groups = {
+                f"{base_calendar_name} – {name}": group_df.drop(columns=["__bucket"])
+                for name, group_df in df.groupby("__bucket")
+            }
 
-        _ = await ensure_window_or_retry(page, timeout_ms)
+        for cal_name, group_df in groups.items():
+            logging.info(f"--- Syncing Calendar: {cal_name} ---")
+            calendar_id = self.get_or_create_calendar(cal_name)
 
-        raw = pd.DataFrame()
+            existing_events_map = self.get_synced_events(calendar_id)
+            source_fingerprints = set(group_df["fingerprint"])
+            existing_fingerprints = set(existing_events_map.keys())
 
-        # Export (optional)
-        dest = None
-        if not prefer_grid:
-            dest = await click_export_and_download(page, timeout_ms, downloads_dir)
-            if dest and dest.suffix.lower() == ".csv":
-                try:
-                    raw = read_csv_smart(dest)
-                    print(f"[CSV] Spalten: {list(raw.columns)}")
-                except Exception as e:
-                    print(f"Konnte CSV nicht parsen: {e}")
+            to_create_fingerprints = source_fingerprints - existing_fingerprints
+            to_delete_fingerprints = existing_fingerprints - source_fingerprints
 
-        # Grid-Scrape (direkt oder Fallback)
-        if raw.empty:
-            _ = await wait_for_results_frame(page, timeout_ms)
-            (ARTIFACTS_DIR / "after_find.html").write_text(
-                await page.content(), encoding="utf-8"
+            unchanged_count = len(
+                source_fingerprints.intersection(existing_fingerprints)
             )
-            raw = await collect_all_pages(page, timeout_ms)
+            logging.info(
+                f"Delta found: {len(to_create_fingerprints)} to create, {len(to_delete_fingerprints)} to delete, {unchanged_count} unchanged."
+            )
+
+            creation_requests = []
+            df_to_create = group_df[
+                group_df["fingerprint"].isin(to_create_fingerprints)
+            ]
+            for _, row in df_to_create.iterrows():
+                event_body = self._create_event_body(row)
+                creation_requests.append(
+                    self.service.events().insert(
+                        calendarId=calendar_id, body=event_body
+                    )
+                )
+
+            deletion_requests = []
+            for fp in to_delete_fingerprints:
+                event_id = existing_events_map[fp]
+                deletion_requests.append(
+                    self.service.events().delete(
+                        calendarId=calendar_id, eventId=event_id
+                    )
+                )
+
+            created_s, created_f = self._execute_batch(
+                creation_requests, "Creating new events"
+            )
+            deleted_s, deleted_f = self._execute_batch(
+                deletion_requests, "Deleting old events"
+            )
+
+            logging.info(
+                f"Sync for '{cal_name}' complete. Created: {created_s}/{created_s+created_f}, Deleted: {deleted_s}/{deleted_s+deleted_f}."
+            )
+
+
+# ------------------ BROWSER AUTOMATION ------------------
+class BFHScraper:
+    def __init__(self, timeout_ms: int, downloads_path: Path):
+        self.timeout_ms = timeout_ms
+        self.downloads_path = downloads_path
+        self.context = None
+        self.page = None
+
+    async def __aenter__(self):
+        playwright = await async_playwright().start()
+        self.context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=Config.USER_PROFILE_DIR,
+            headless=False,
+            accept_downloads=True,
+            slow_mo=50,
+        )
+        self.page = await self.context.new_page()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.context:
+            await self.context.close()
+
+    async def navigate_and_filter(
+        self, start_ts: pd.Timestamp, end_ts: pd.Timestamp
+    ) -> bool:
+        logging.info(f"Navigating to {Config.FIND_URL}...")
+        await self.page.goto(Config.FIND_URL, wait_until="domcontentloaded")
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=15000)
+        except PWTimeoutError:
+            logging.warning(
+                "Network idle timeout reached on initial load, continuing anyway."
+            )
+
+        logging.info("Setting side panel filters...")
+        await self.page.locator("#ReservationFilter_ManualDateTimeSelection").check(
+            timeout=5000
+        )
+        await self.page.evaluate(
+            f"document.querySelector('#ReservationFilter_Beginn').value = '{format_for_sidepanel(start_ts)}'"
+        )
+        await self.page.evaluate(
+            f"document.querySelector('#ReservationFilter_Ende').value = '{format_for_sidepanel(end_ts)}'"
+        )
+
+        find_button = self.page.locator(",".join(Config.FIND_BUTTON_SELECTORS)).first
+        if await find_button.is_visible():
+            await find_button.click()
+            logging.info("'Finden' button clicked.")
             try:
-                print(f"[GRID] Spalten: {list(raw.columns)}")
-                print("[GRID] Kopf (5 Zeilen):")
-                print(raw.head(5).to_string(index=False))
-            except Exception:
-                pass
+                await self.page.wait_for_load_state("networkidle", timeout=30000)
+                logging.info("Search results appear to have loaded (network is idle).")
+            except PWTimeoutError:
+                logging.warning(
+                    "Timeout waiting for network idle after search. The page might be slow or stuck."
+                )
+            return True
 
-        await context.close()
+        logging.warning("Could not find 'Finden' button, trying form submit.")
+        await self.page.evaluate("document.querySelector('#sidePanelForm').submit()")
+        return True
 
-    if raw is None or raw.empty:
-        print("[SCRAPE] Keine Daten - Abbruch ohne Google-Kalender.")
-        return
+    async def close_toasts(self):
+        for selector in Config.TOAST_CLOSE_SELECTORS:
+            buttons = self.page.locator(selector)
+            for i in range(await buttons.count()):
+                try:
+                    await buttons.nth(i).click(timeout=500)
+                except PWTimeoutError:
+                    pass
 
-    print(f"[SCRAPE] Rohzeilen (alle Seiten): {len(raw)}")
-    df = normalize_to_room_times(raw)
+    async def get_csv_export(self) -> Optional[Path]:
+        await self.close_toasts()
+        export_button = self.page.locator(
+            ",".join(Config.EXPORT_BUTTON_SELECTORS)
+        ).first
+        if not await export_button.is_visible(timeout=10000):
+            logging.warning("Export button not found. Will fall back to grid scraping.")
+            return None
+
+        await export_button.click()
+        logging.info("Export clicked. Now polling for the download link to appear...")
+
+        download_link_found = None
+        polling_end_time = time.time() + 180
+
+        while time.time() < polling_end_time:
+            try:
+                notification_link_selector = ".ui-notify-message a, .k-notification-content a, div[role='alert'] a"
+                link_locator = self.page.locator(notification_link_selector).first
+                if await link_locator.is_visible(timeout=1000):
+                    logging.info("Download link appeared in notification!")
+                    download_link_found = link_locator
+                    break
+            except PWTimeoutError:
+                logging.info("...still waiting for link...")
+                await asyncio.sleep(5)
+
+        if download_link_found:
+            try:
+                async with self.page.expect_download(
+                    timeout=self.timeout_ms
+                ) as download_info:
+                    await download_link_found.click()
+                download = await download_info.value
+                dest_path = Config.ARTIFACTS_DIR / download.suggested_filename
+                await download.save_as(dest_path)
+                logging.info(f"Download successful via polled link: {dest_path.name}")
+                return dest_path
+            except PWTimeoutError:
+                logging.error("Found the link, but the download itself timed out.")
+
+        logging.error("Failed to find the download link within 3 minutes.")
+        return None
+
+    async def scrape_grid_fallback(self) -> pd.DataFrame:
+        logging.info("Attempting to scrape data directly from the grid...")
+        try:
+            await self.page.wait_for_selector(".k-grid-content tr", timeout=15000)
+            headers = await self.page.eval_on_selector_all(
+                ".k-grid-header th", "nodes => nodes.map(n => n.innerText.trim())"
+            )
+            rows = await self.page.eval_on_selector_all(
+                ".k-grid-content tr",
+                "nodes => nodes.map(tr => Array.from(tr.cells).map(td => td.innerText.trim()))",
+            )
+            if not rows:
+                return pd.DataFrame()
+            for row in rows:
+                while len(row) < len(headers):
+                    row.append("")
+            return pd.DataFrame(rows, columns=headers)
+        except (PWTimeoutError, Exception) as e:
+            logging.error(f"Grid scraping failed: {e}")
+            return pd.DataFrame()
+
+
+# ------------------ FILE I/O ------------------
+def read_csv_robustly(path: Path) -> pd.DataFrame:
+    encodings = ["utf-8-sig", "utf-16", "latin1", "cp1252"]
+    separators = [None, ";", ","]
+    for enc in encodings:
+        for sep in separators:
+            try:
+                df = pd.read_csv(path, encoding=enc, sep=sep, engine="python")
+                if df.shape[1] > 2:
+                    logging.info(
+                        f"Successfully read CSV with encoding '{enc}' and separator '{sep or 'auto'}'"
+                    )
+                    return df
+            except (UnicodeDecodeError, pd.errors.ParserError):
+                continue
+    raise ValueError(f"Could not read CSV file: {path}")
+
+
+def export_html_timeline(df: pd.DataFrame, out_path: Path):
     if df.empty:
-        print("[NORM] Keine (Von, Bis, Raum) Zeilen im 7-Tage-Fenster.")
+        return
+    start, end = get_sync_window()
+    days = pd.date_range(start.normalize(), end.normalize(), freq="D")
+    hour_min, hour_max = 6, 22
+    rooms = sorted(df["room_code"].fillna(df["room_full"]).unique())
+    html = f"""<!doctype html><html lang="de"><head><meta charset="utf-8"><title>BFH Rooms Timeline</title>
+<style>body{{font-family:sans-serif;margin:1em}}h2{{margin-bottom:0}}.grid{{display:grid;grid-template-columns:180px repeat({len(days)},1fr);gap:4px;margin-top:1em}}.head{{font-weight:700;text-align:center;padding-bottom:4px}}.cell{{position:relative;border:1px solid #ddd;min-height:44px;background:#fafafa;overflow:hidden}}.room{{padding:6px 8px;font-weight:700;border:1px solid #ddd;background:#f0f3f8}}.bar{{position:absolute;height:70%;top:15%;background:#4a69bd;opacity:.85;color:#fff;font-size:12px;line-height:1.2;padding:4px 6px;border-radius:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-sizing:border-box}}</style>
+</head><body><h2>BFH Rooms Timeline</h2><p>{start.strftime("%d.%m.%Y")} → {end.strftime("%d.%m.%Y")} ({hour_min:02d}:00–{hour_max:02d}:00)</p><div class="grid">
+<div></div>{''.join(f'<div class="head">{d.strftime("%a, %d.%m.")}</div>' for d in days)}"""
+
+    def to_percent(ts, day):
+        day_start = day.replace(hour=hour_min, minute=0, second=0)
+        day_end = day.replace(hour=hour_max, minute=0, second=0)
+        total_seconds = (day_end - day_start).total_seconds()
+        ts_seconds = (ts - day_start).total_seconds()
+        return max(0, min(100, (ts_seconds / total_seconds) * 100))
+
+    for room in rooms:
+        html += f'<div class="room">{room}</div>\n'
+        for d_ts in days:
+            html += '<div class="cell">\n'
+            day_start_utc = (
+                pd.Timestamp(d_ts).tz_localize(Config.LOCAL_TIMEZONE).normalize()
+            )
+            day_end_utc = day_start_utc + timedelta(days=1)
+            items = df[
+                (df["room_code"].fillna(df["room_full"]) == room)
+                & (df["start_time"] < day_end_utc)
+                & (df["end_time"] > day_start_utc)
+            ]
+            for _, r in items.iterrows():
+                left = to_percent(r["start_time"], day_start_utc)
+                right = to_percent(r["end_time"], day_start_utc)
+                width = max(0.5, right - left)
+                html += f'<div class="bar" style="left:{left:.2f}%;width:{width:.2f}%" title="{r["location"]}"></div>\n'
+            html += "</div>\n"
+    html += "</div></body></html>"
+    out_path.write_text(html, encoding="utf-8")
+    logging.info(f"HTML timeline exported to: {out_path}")
+
+
+# ------------------ MAIN LOGIC ------------------
+async def main(args: argparse.Namespace):
+    Config.ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    downloads_dir = (
+        Path(args.downloads) if args.downloads else (Path.home() / "Downloads")
+    )
+
+    start_win, end_win = get_sync_window()
+    logging.info(
+        f"🗓️ Syncing for period: {start_win.strftime('%d.%m.%Y')} to {end_win.strftime('%d.%m.%Y')}"
+    )
+
+    raw_df = pd.DataFrame()
+    async with BFHScraper(args.timeout, downloads_dir) as scraper:
+        await scraper.navigate_and_filter(start_win, end_win)
+        csv_path = await scraper.get_csv_export()
+        if csv_path:
+            try:
+                raw_df = read_csv_robustly(csv_path)
+            except ValueError as e:
+                logging.error(f"{e}. Falling back to grid scraping.")
+        if raw_df.empty:
+            raw_df = await scraper.scrape_grid_fallback()
+
+    if raw_df.empty:
+        logging.error("❌ No data could be fetched. Aborting sync.")
         return
 
-    if chunk:
-        df = chunk_to_days_6_22(df)
+    logging.info(f"Normalizing {len(raw_df)} raw entries...")
+    df = normalize_dataframe(raw_df)
 
-    print(f"[NORM] Zeilen im Fenster: {len(df)}")
-    try:
-        print("[NORM] Vorschau:")
-        print(df.head(10).to_string(index=False))
-    except Exception:
-        pass
+    if df.empty:
+        logging.warning(
+            "No valid reservations found in the time window. Nothing to sync."
+        )
+        return
 
-    # HTML-Tafel
-    export_html_timeline(df, ARTIFACTS_DIR / "schedule.html")
+    logging.info(f"Found {len(df)} valid reservations to sync.")
+    print("--- Data Preview ---")
+    print(df.head().to_string(index=False))
+    print("--------------------")
 
-    # Google push
-    svc = load_gcal_service()
-    group_and_push_by_calendar(svc, calendar, df, split_by)
-    print("Sync fertig.")
+    gcal = GCalManager()
+    gcal.sync_events(args.calendar, df, args.split_by)
+
+    if args.html:
+        export_html_timeline(df, Config.ARTIFACTS_DIR / "schedule.html")
+
+    logging.info("✅ Sync process completed successfully.")
 
 
-# ------------------ CLI ------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Sync BFH room reservations to Google Calendar."
+    )
     parser.add_argument(
         "--timeout",
         type=int,
         default=180000,
-        help="Timeout fuer Export/Grid in Millisekunden",
+        help="Timeout for browser operations in milliseconds.",
     )
     parser.add_argument(
-        "--calendar", default="Rooms_BFH_Kilchenmann", help="Basiskalendername"
+        "--calendar",
+        default=Config.DEFAULT_CALENDAR_NAME,
+        help="Base name for the Google Calendar.",
     )
     parser.add_argument(
-        "--downloads", default=None, help="Optionaler Pfad zum Downloads-Ordner"
+        "--downloads", help="Override path to the browser's downloads folder."
     )
     parser.add_argument(
         "--split-by",
         choices=["none", "standort", "gebaeude"],
         default="none",
-        help="Kalender-Aufteilung",
+        help="Split events into different calendars.",
     )
     parser.add_argument(
-        "--no-chunk", action="store_true", help="Deaktiviert Tages-Splitting 06-22"
-    )
-    parser.add_argument(
-        "--prefer-grid",
-        action="store_true",
-        help="Export ueberspringen und direkt Grid scrapen",
-    )
-    parser.add_argument(
-        "--alert-to", default=None, help="E-Mail fuer Login-Fehler (override)"
+        "--html", action="store_true", help="Generate an additional HTML timeline file."
     )
 
-    args = parser.parse_args()
-    if args.alert_to:
-        os.environ["ALERT_TO"] = args.alert_to
-
-    asyncio.run(
-        run(
-            args.timeout,
-            args.calendar,
-            args.downloads,
-            args.split_by,
-            chunk=(not args.no_chunk),
-            prefer_grid=args.prefer_grid,
-        )
-    )
+    cli_args = parser.parse_args()
+    asyncio.run(main(cli_args))
