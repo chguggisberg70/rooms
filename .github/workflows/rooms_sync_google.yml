@@ -1,32 +1,37 @@
-name: BFH Rooms Sync
+name: Run BFH Rooms Sync
 
 on:
-  schedule:
-    # Deine Cron-Jobs für die automatische Ausführung
-    - cron: '0 6,11,16 * 3-10 1-6'
-    - cron: '0 7,12,17 * 11-12 1-6'
-    - cron: '0 7,12,17 * 1-2 1-6'
   workflow_dispatch:
+  # Aktiviere deine gewünschten Zeiten hier:
+  # schedule:
+  #   - cron: '0 6,11,16 * 3-10 1-6'
+  #   - cron: '0 7,12,17 * 11-12 1-6'
+  #   - cron: '0 7,12,17 * 1-2 1-6'
+
+concurrency:
+  group: rooms_sync_google
+  cancel-in-progress: false
 
 jobs:
-  run-sync:
+  run:
+    # Falls dein Runner nur "self-hosted" trägt, lass es so.
+    # Wenn er auch Linux/X64 Labels hat: runs-on: [self-hosted, Linux, X64]
     runs-on: self-hosted
     timeout-minutes: 45
     env:
-      # Setzt die Zeitzone für den Server korrekt
       TZ: Europe/Zurich
+      PYTHONUNBUFFERED: "1"
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
-      # Caching für pip, um die Installation zu beschleunigen
-      - name: Cache pip dependencies
+
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -34,43 +39,61 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      # Caching für den Playwright-Browser, um den Download zu beschleunigen
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-playwright-
-
-      - name: Install Playwright browser
-        # Dieser Befehl installiert den Chromium-Browser und alle System-Abhängigkeiten
-        run: python -m playwright install --with-deps chromium
-
-      - name: Restore Google Credentials
-        # Erstellt die credential-Dateien aus den sicheren GitHub Secrets
+      - name: Install deps (pip + Playwright Chromium)
+        shell: bash
         run: |
-          echo "${{ secrets.GOOGLE_CREDENTIALS_JSON }}" > credentials.json
-          echo "${{ secrets.GOOGLE_TOKEN_JSON }}" > token.json
-      
-      - name: Run BFH Rooms Sync
-        # Führt das Skript aus und übergibt das neue --headless Argument
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Write storage_state.json from secret
+        shell: bash
         run: |
-          python rooms_sync_google.py \
-            --calendar "Rooms_BFH_Kilchenmann" \
-            --split-by standort \
-            --headless \
-            --timeout 240000
+          # Multiline-sicherer Here-Doc. Secret: PLAYWRIGHT_AUTH_STATE
+          cat > storage_state.json <<'JSON'
+          ${{ secrets.PLAYWRIGHT_AUTH_STATE }}
+          JSON
+          # Sanity-Check: Datei darf nicht leer sein
+          test -s storage_state.json || { echo "storage_state.json ist leer – Secret falsch?"; exit 2; }
+
+      - name: Run sync with retries
+        shell: bash
+        env:
+          # Optional: zusätzliche Timeouts für dein Script (falls unterstützt)
+          ROOMS_NAV_TIMEOUT_MS: "180000"
+          ROOMS_GOTO_TIMEOUT_MS: "180000"
+        run: |
+          set -e
+          mkdir -p artifacts_sync
+          attempts=(1 2 3)
+          delays=(10 30 60)  # Sekunden Backoff
+          for i in "${!attempts[@]}"; do
+            echo "=== Versuch ${attempts[$i]} von ${#attempts[@]} ==="
+            # Beispiel-Start – passe Flags an deine CLI an
+            python rooms_sync_google.py \
+              --storage-state storage_state.json \
+              --calendar "Rooms_BFH_Kilchenmann" \
+              --split-by standort \
+              --timeout 240000 && break || rc=$?
+
+            echo "Run fehlgeschlagen (Exit $rc)."
+            if [ "$i" -lt "$(( ${#attempts[@]} - 1 ))" ]; then
+              echo "Warte ${delays[$i]}s und versuche erneut…"
+              sleep "${delays[$i]}"
+            else
+              echo "Alle Versuche fehlgeschlagen."
+              exit "$rc"
+            fi
+          done
 
       - name: Upload artifacts for debugging
-        # Lädt bei Erfolg oder Fehlschlag die erstellten Dateien hoch
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rooms-artifacts
-          path: artifacts_sync/
+          path: |
+            artifacts_sync/**
+            storage_state.json
+            **/playwright-report/**
+            **/trace.zip
           if-no-files-found: ignore
-
+          compression-level: 6
