@@ -13,6 +13,7 @@ Features:
 - Supports splitting events into separate calendars by location or building (--split-by).
 - Optionally generates a local HTML timeline view of the reservations (--html).
 - Supports headless operation for server environments (--headless).
+- NEW: Supports Playwright storage_state for SSO without interaction (--storage-state).
 """
 
 import argparse
@@ -37,6 +38,7 @@ from playwright.async_api import (
     Locator,
 )
 from google.oauth2.credentials import Credentials
+import google.auth.exceptions
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -117,9 +119,11 @@ def format_for_sidepanel(ts: pd.Timestamp) -> str:
 # ------------------ DATA NORMALIZATION ------------------
 def extract_room_code(room_name: str) -> str:
     s = str(room_name or "").strip()
-    if not s: return ""
+    if not s:
+        return ""
     tokens = s.split()
-    if not tokens: return ""
+    if not tokens:
+        return ""
     if any(char.isdigit() for char in tokens[0]):
         if len(tokens) > 1 and len(tokens[0]) <= 2 and tokens[0].isalpha():
             return f"{tokens[0]} {tokens[1]}"
@@ -130,13 +134,15 @@ def extract_room_code(room_name: str) -> str:
 
 
 def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame()
     col_map = {str(c).lower(): str(c) for c in df.columns}
 
     def find_col(keys: List[str]) -> Optional[str]:
         for key in keys:
             for col_lower, col_original in col_map.items():
-                if key in col_lower: return col_original
+                if key in col_lower:
+                    return col_original
         return None
 
     col_aliases = {
@@ -148,7 +154,9 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     col_start = find_col(col_aliases["start"]) or (df.columns[0] if df.shape[1] > 0 else None)
     col_end = find_col(col_aliases["end"]) or (df.columns[1] if df.shape[1] > 1 else None)
-    col_room = find_col(col_aliases["room"]) or (df.columns[5] if df.shape[1] > 5 else (df.columns[3] if df.shape[1] > 3 else None))
+    col_room = find_col(col_aliases["room"]) or (
+        df.columns[5] if df.shape[1] > 5 else (df.columns[3] if df.shape[1] > 3 else None)
+    )
     col_location = find_col(col_aliases["location"])
 
     if not all([col_start, col_end, col_room]):
@@ -158,33 +166,38 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     def parse_datetime(series):
         return pd.to_datetime(series, dayfirst=True, errors="coerce")
 
-    clean_df = pd.DataFrame({
-        "start_time": parse_datetime(df[col_start]),
-        "end_time": parse_datetime(df[col_end]),
-        "room_full": df[col_room].astype(str),
-        "location": df[col_location].astype(str) if col_location else "",
-    })
+    clean_df = pd.DataFrame(
+        {
+            "start_time": parse_datetime(df[col_start]),
+            "end_time": parse_datetime(df[col_end]),
+            "room_full": df[col_room].astype(str),
+            "location": df[col_location].astype(str) if col_location else "",
+        }
+    )
 
     clean_df = clean_df.dropna(subset=["start_time", "end_time"])
     clean_df = clean_df[clean_df["end_time"] > clean_df["start_time"]].copy()
 
-    if clean_df.empty: return clean_df
-    
+    if clean_df.empty:
+        return clean_df
+
     for col in ["start_time", "end_time"]:
-        clean_df[col] = clean_df[col].dt.tz_localize(Config.LOCAL_TIMEZONE, ambiguous='infer')
+        clean_df[col] = clean_df[col].dt.tz_localize(Config.LOCAL_TIMEZONE, ambiguous="infer")
 
     max_duration = timedelta(days=Config.SYNC_WINDOW_DAYS + 1)
     clean_df = clean_df[clean_df["end_time"] - clean_df["start_time"] < max_duration]
 
     start_win, end_win = get_sync_window()
-    clean_df = clean_df[
-        (clean_df["start_time"] <= end_win) & (clean_df["end_time"] >= start_win)
-    ].copy()
+    clean_df = clean_df[(clean_df["start_time"] <= end_win) & (clean_df["end_time"] >= start_win)].copy()
 
     clean_df["room_code"] = clean_df["room_full"].apply(extract_room_code)
     clean_df["fingerprint"] = clean_df.apply(
-        lambda row: hashlib.sha1(f"{row['start_time'].isoformat()}|{row['end_time'].isoformat()}|{row['room_full']}|{row['location']}".encode("utf-8")).hexdigest(),
-        axis=1
+        lambda row: hashlib.sha1(
+            f"{row['start_time'].isoformat()}|{row['end_time'].isoformat()}|{row['room_full']}|{row['location']}".encode(
+                "utf-8"
+            )
+        ).hexdigest(),
+        axis=1,
     )
     return clean_df.sort_values(["start_time", "room_code"]).reset_index(drop=True)
 
@@ -202,12 +215,21 @@ class GCalManager:
         if Config.TOKEN_FILE.exists():
             creds = Credentials.from_authorized_user_file(str(Config.TOKEN_FILE), Config.GCAL_SCOPES)
         if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(Config.CREDENTIALS_FILE, Config.GCAL_SCOPES)
-                creds = flow.run_local_server(port=0)
-            Config.TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+            try:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                else:
+                    flow = InstalledAppFlow.from_client_secrets_file(
+                        Config.CREDENTIALS_FILE, Config.GCAL_SCOPES
+                    )
+                    creds = flow.run_local_server(port=0)
+                Config.TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+            except (FileNotFoundError, google.auth.exceptions.DefaultCredentialsError):
+                logging.error(
+                    "Google-Credentials fehlen oder sind ungültig. "
+                    "Lege 'credentials.json' bei und authentifiziere einmal lokal, damit 'token.json' entsteht."
+                )
+                raise
         return build("calendar", "v3", credentials=creds)
 
     def get_or_create_calendar(self, calendar_name: str) -> str:
@@ -219,8 +241,9 @@ class GCalManager:
                     logging.info(f"Found existing calendar '{calendar_name}' (ID: {item['id']})")
                     return item["id"]
             page_token = cal_list.get("nextPageToken")
-            if not page_token: break
-        
+            if not page_token:
+                break
+
         logging.info(f"Creating new calendar: '{calendar_name}'")
         new_cal = {"summary": calendar_name, "timeZone": Config.LOCAL_TIMEZONE_NAME}
         created_cal = self.service.calendars().insert(body=new_cal).execute()
@@ -230,7 +253,7 @@ class GCalManager:
         """Fetches existing synced events and returns a map of {fingerprint: event_id}."""
         now_utc = pd.Timestamp.now(tz="UTC")
         max_utc = now_utc + timedelta(days=Config.GCAL_DELETE_HORIZON_DAYS)
-        
+
         existing_events = {}
         page_token = None
         while True:
@@ -242,15 +265,16 @@ class GCalManager:
                 maxResults=2500,
                 pageToken=page_token,
             ).execute()
-            
+
             for event in events_result.get("items", []):
                 props = event.get("extendedProperties", {}).get("private", {})
                 if props.get("source") == Config.GCAL_SOURCE_TAG and "fp" in props:
                     existing_events[props["fp"]] = event["id"]
-            
+
             page_token = events_result.get("nextPageToken")
-            if not page_token: break
-        
+            if not page_token:
+                break
+
         logging.info(f"Found {len(existing_events)} existing events in calendar.")
         return existing_events
 
@@ -258,11 +282,11 @@ class GCalManager:
     def _create_event_body(row: pd.Series) -> Dict[str, Any]:
         summary_parts = ["Belegt", row.get("room_code", "").strip()]
         location_parts = [row.get("room_full", "").strip()]
-        
+
         if location := row.get("location", "").strip():
             summary_parts.append(location)
             location_parts.append(location)
-        
+
         summary = " – ".join(filter(None, summary_parts))
         location_str = " | ".join(filter(None, location_parts))
 
@@ -277,22 +301,23 @@ class GCalManager:
         }
 
     def _execute_batch(self, requests: List[Dict], progress_desc: str):
-        if not requests: return 0, 0
-        
+        if not requests:
+            return 0, 0
+
         success_count = 0
-        
+
         def callback(request_id, response, exception):
             nonlocal success_count
             if not exception:
                 success_count += 1
-        
+
         with tqdm(total=len(requests), desc=progress_desc) as pbar:
             for i in range(0, len(requests), Config.GCAL_BATCH_CHUNK_SIZE):
-                chunk = requests[i:i + Config.GCAL_BATCH_CHUNK_SIZE]
+                chunk = requests[i : i + Config.GCAL_BATCH_CHUNK_SIZE]
                 batch = self.service.new_batch_http_request()
                 for req in chunk:
                     batch.add(req, callback=callback)
-                
+
                 batch.execute()
                 pbar.update(len(chunk))
 
@@ -321,58 +346,99 @@ class GCalManager:
                 return s.split(" - ")[0].strip() if split_by == "gebaeude" else s
 
             df["__bucket"] = df["location"].apply(get_bucket)
-            groups = {f"{base_calendar_name} – {name}": group_df.drop(columns=["__bucket"]) for name, group_df in df.groupby("__bucket")}
+            groups = {
+                f"{base_calendar_name} – {name}": group_df.drop(columns=["__bucket"])
+                for name, group_df in df.groupby("__bucket")
+            }
 
         for cal_name, group_df in groups.items():
             logging.info(f"--- Syncing Calendar: {cal_name} ---")
             calendar_id = self.get_or_create_calendar(cal_name)
-            
+
             existing_events_map = self.get_synced_events(calendar_id)
             source_fingerprints = set(group_df["fingerprint"])
             existing_fingerprints = set(existing_events_map.keys())
-            
+
             to_create_fingerprints = source_fingerprints - existing_fingerprints
             to_delete_fingerprints = existing_fingerprints - source_fingerprints
-            
+
             unchanged_count = len(source_fingerprints.intersection(existing_fingerprints))
-            logging.info(f"Delta found: {len(to_create_fingerprints)} to create, {len(to_delete_fingerprints)} to delete, {unchanged_count} unchanged.")
+            logging.info(
+                f"Delta found: {len(to_create_fingerprints)} to create, "
+                f"{len(to_delete_fingerprints)} to delete, {unchanged_count} unchanged."
+            )
 
             creation_requests = []
             df_to_create = group_df[group_df["fingerprint"].isin(to_create_fingerprints)]
             for _, row in df_to_create.iterrows():
                 event_body = self._create_event_body(row)
-                creation_requests.append(self.service.events().insert(calendarId=calendar_id, body=event_body))
+                creation_requests.append(
+                    self.service.events().insert(calendarId=calendar_id, body=event_body)
+                )
 
             deletion_requests = []
             for fp in to_delete_fingerprints:
                 event_id = existing_events_map[fp]
-                deletion_requests.append(self.service.events().delete(calendarId=calendar_id, eventId=event_id))
+                deletion_requests.append(
+                    self.service.events().delete(calendarId=calendar_id, eventId=event_id)
+                )
 
             created_s, created_f = self._execute_batch(creation_requests, "Creating new events")
             deleted_s, deleted_f = self._execute_batch(deletion_requests, "Deleting old events")
-            
-            logging.info(f"Sync for '{cal_name}' complete. Created: {created_s}/{created_s+created_f}, Deleted: {deleted_s}/{deleted_s+deleted_f}.")
+
+            logging.info(
+                f"Sync for '{cal_name}' complete. "
+                f"Created: {created_s}/{created_s+created_f}, Deleted: {deleted_s}/{deleted_s+deleted_f}."
+            )
 
 
 # ------------------ BROWSER AUTOMATION ------------------
 class BFHScraper:
-    def __init__(self, timeout_ms: int, downloads_path: Path, headless: bool):
+    def __init__(self, timeout_ms: int, downloads_path: Path, headless: bool, storage_state: Optional[str] = None):
         self.timeout_ms = timeout_ms
         self.downloads_path = downloads_path
         self.headless = headless
+        self.storage_state = storage_state
+        self._pw = None
+        self._browser = None
         self.context = None
         self.page = None
 
     async def __aenter__(self):
-        playwright = await async_playwright().start()
-        self.context = await playwright.chromium.launch_persistent_context(
-            user_data_dir=Config.USER_PROFILE_DIR, headless=self.headless, accept_downloads=True, slow_mo=50
-        )
+        self._pw = await async_playwright().start()
+
+        if self.storage_state:
+            # Headless-freundlich: SSO-Cookies aus storage_state.json laden
+            logging.info(f"Using storage_state for auth: {self.storage_state}")
+            if not os.path.isfile(self.storage_state):
+                raise FileNotFoundError(f"storage_state.json nicht gefunden: {self.storage_state}")
+            self._browser = await self._pw.chromium.launch(headless=self.headless)
+            self.context = await self._browser.new_context(
+                storage_state=self.storage_state,
+                accept_downloads=True,
+            )
+        else:
+            # Persistentes Profil (wie bisher)
+            logging.info(f"Using persistent profile at: {Config.USER_PROFILE_DIR}")
+            self.context = await self._pw.chromium.launch_persistent_context(
+                user_data_dir=Config.USER_PROFILE_DIR,
+                headless=self.headless,
+                accept_downloads=True,
+                slow_mo=50,
+            )
+
         self.page = await self.context.new_page()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.context: await self.context.close()
+        try:
+            if self.context:
+                await self.context.close()
+            if self._browser:
+                await self._browser.close()
+        finally:
+            if self._pw:
+                await self._pw.stop()
 
     async def navigate_and_filter(self, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> bool:
         logging.info(f"Navigating to {Config.FIND_URL}...")
@@ -384,14 +450,18 @@ class BFHScraper:
 
         logging.info("Setting side panel filters...")
         await self.page.screenshot(path=Config.ARTIFACTS_DIR / "debug_before_check.png")
-        
+
         try:
             await self.page.locator("#ReservationFilter_ManualDateTimeSelection").check(timeout=5000)
-            
-            await self.page.evaluate(f"document.querySelector('#ReservationFilter_Beginn').value = '{format_for_sidepanel(start_ts)}'")
-            await self.page.evaluate(f"document.querySelector('#ReservationFilter_Ende').value = '{format_for_sidepanel(end_ts)}'")
-            
-            find_button = self.page.locator(','.join(Config.FIND_BUTTON_SELECTORS)).first
+
+            await self.page.evaluate(
+                f"document.querySelector('#ReservationFilter_Beginn').value = '{format_for_sidepanel(start_ts)}'"
+            )
+            await self.page.evaluate(
+                f"document.querySelector('#ReservationFilter_Ende').value = '{format_for_sidepanel(end_ts)}'"
+            )
+
+            find_button = self.page.locator(",".join(Config.FIND_BUTTON_SELECTORS)).first
             if await find_button.is_visible():
                 await find_button.click()
                 logging.info("'Finden' button clicked.")
@@ -406,7 +476,7 @@ class BFHScraper:
             await self.page.screenshot(path=Config.ARTIFACTS_DIR / "debug_on_failure.png")
             logging.error("A screenshot named 'debug_on_failure.png' has been saved to the artifacts.")
             raise e
-        
+
         logging.warning("Could not find 'Finden' button, trying form submit.")
         await self.page.evaluate("document.querySelector('#sidePanelForm').submit()")
         return True
@@ -415,12 +485,14 @@ class BFHScraper:
         for selector in Config.TOAST_CLOSE_SELECTORS:
             buttons = self.page.locator(selector)
             for i in range(await buttons.count()):
-                try: await buttons.nth(i).click(timeout=500)
-                except PWTimeoutError: pass
+                try:
+                    await buttons.nth(i).click(timeout=500)
+                except PWTimeoutError:
+                    pass
 
     async def get_csv_export(self) -> Optional[Path]:
         await self.close_toasts()
-        export_button = self.page.locator(','.join(Config.EXPORT_BUTTON_SELECTORS)).first
+        export_button = self.page.locator(",".join(Config.EXPORT_BUTTON_SELECTORS)).first
         if not await export_button.is_visible(timeout=10000):
             logging.warning("Export button not found. Will fall back to grid scraping.")
             return None
@@ -462,15 +534,23 @@ class BFHScraper:
         logging.info("Attempting to scrape data directly from the grid...")
         try:
             await self.page.wait_for_selector(".k-grid-content tr", timeout=15000)
-            headers = await self.page.eval_on_selector_all(".k-grid-header th", "nodes => nodes.map(n => n.innerText.trim())")
-            rows = await self.page.eval_on_selector_all(".k-grid-content tr", "nodes => nodes.map(tr => Array.from(tr.cells).map(td => td.innerText.trim()))")
-            if not rows: return pd.DataFrame()
+            headers = await self.page.eval_on_selector_all(
+                ".k-grid-header th", "nodes => nodes.map(n => n.innerText.trim())"
+            )
+            rows = await self.page.eval_on_selector_all(
+                ".k-grid-content tr",
+                "nodes => nodes.map(tr => Array.from(tr.cells).map(td => td.innerText.trim()))",
+            )
+            if not rows:
+                return pd.DataFrame()
             for row in rows:
-                while len(row) < len(headers): row.append('')
+                while len(row) < len(headers):
+                    row.append("")
             return pd.DataFrame(rows, columns=headers)
         except (PWTimeoutError, Exception) as e:
             logging.error(f"Grid scraping failed: {e}")
             return pd.DataFrame()
+
 
 # ------------------ FILE I/O ------------------
 def read_csv_robustly(path: Path) -> pd.DataFrame:
@@ -483,26 +563,32 @@ def read_csv_robustly(path: Path) -> pd.DataFrame:
                 if df.shape[1] > 2:
                     logging.info(f"Successfully read CSV with encoding '{enc}' and separator '{sep or 'auto'}'")
                     return df
-            except (UnicodeDecodeError, pd.errors.ParserError): continue
+            except (UnicodeDecodeError, pd.errors.ParserError):
+                continue
     raise ValueError(f"Could not read CSV file: {path}")
 
+
 def export_html_timeline(df: pd.DataFrame, out_path: Path):
-    if df.empty: return
+    if df.empty:
+        return
     df_for_table = df.copy()
-    df_for_table['start_time_str'] = df_for_table['start_time'].dt.strftime('%d.%m.%Y %H:%M')
-    df_for_table['end_time_str'] = df_for_table['end_time'].dt.strftime('%d.%m.%Y %H:%M')
-    table_json_data = df_for_table[['start_time_str', 'end_time_str', 'room_code', 'location', 'room_full']].to_json(orient="records")
+    df_for_table["start_time_str"] = df_for_table["start_time"].dt.strftime("%d.%m.%Y %H:%M")
+    df_for_table["end_time_str"] = df_for_table["end_time"].dt.strftime("%d.%m.%Y %H:%M")
+    table_json_data = df_for_table[
+        ["start_time_str", "end_time_str", "room_code", "location", "room_full"]
+    ].to_json(orient="records")
     start, end = get_sync_window()
     days = pd.date_range(start.normalize(), end.normalize(), freq="D")
     hour_min, hour_max = 6, 22
-    rooms = sorted(df['room_code'].fillna(df['room_full']).unique())
+    rooms = sorted(df["room_code"].fillna(df["room_full"]).unique())
     timeline_html = f"""<div class="timeline-grid">
     <div></div>{''.join(f'<div class="head">{d.strftime("%a, %d.%m.")}</div>' for d in days)}"""
     def to_percent(ts, day):
         day_start = day.replace(hour=hour_min, minute=0, second=0)
         day_end = day.replace(hour=hour_max, minute=0, second=0)
         total_seconds = (day_end - day_start).total_seconds()
-        if total_seconds == 0: return 0.0
+        if total_seconds == 0:
+            return 0.0
         ts_seconds = (ts - day_start).total_seconds()
         return max(0, min(100, (ts_seconds / total_seconds) * 100))
     for room in rooms:
@@ -511,7 +597,11 @@ def export_html_timeline(df: pd.DataFrame, out_path: Path):
             timeline_html += '<div class="cell">\n'
             day_start_utc = pd.Timestamp(d_ts).tz_localize(Config.LOCAL_TIMEZONE).normalize()
             day_end_utc = day_start_utc + timedelta(days=1)
-            items = df[(df["room_code"].fillna(df["room_full"]) == room) & (df["start_time"] < day_end_utc) & (df["end_time"] > day_start_utc)]
+            items = df[
+                (df["room_code"].fillna(df["room_full"]) == room)
+                & (df["start_time"] < day_end_utc)
+                & (df["end_time"] > day_start_utc)
+            ]
             for _, r in items.iterrows():
                 left = to_percent(r["start_time"], day_start_utc)
                 right = to_percent(r["end_time"], day_start_utc)
@@ -545,12 +635,14 @@ async def main(args: argparse.Namespace):
     logging.info(f"🗓️ Syncing for period: {start_win.strftime('%d.%m.%Y')} to {end_win.strftime('%d.%m.%Y')}")
 
     raw_df = pd.DataFrame()
-    async with BFHScraper(args.timeout, downloads_dir, args.headless) as scraper:
+    async with BFHScraper(args.timeout, downloads_dir, args.headless, storage_state=args.storage_state) as scraper:
         await scraper.navigate_and_filter(start_win, end_win)
         csv_path = await scraper.get_csv_export()
         if csv_path:
-            try: raw_df = read_csv_robustly(csv_path)
-            except ValueError as e: logging.error(f"{e}. Falling back to grid scraping.")
+            try:
+                raw_df = read_csv_robustly(csv_path)
+            except ValueError as e:
+                logging.error(f"{e}. Falling back to grid scraping.")
         if raw_df.empty:
             raw_df = await scraper.scrape_grid_fallback()
 
@@ -587,6 +679,11 @@ if __name__ == "__main__":
     parser.add_argument("--split-by", choices=["none", "standort", "gebaeude"], default="none", help="Split events into different calendars.")
     parser.add_argument("--html", action="store_true", help="Generate an additional HTML timeline file.")
     parser.add_argument("--headless", action="store_true", help="Run Playwright in headless mode (for servers).")
-    
+    parser.add_argument(
+        "--storage-state",
+        dest="storage_state",
+        help="Pfad zu Playwright storage_state.json (SSO ohne Interaktion)"
+    )
+
     cli_args = parser.parse_args()
     asyncio.run(main(cli_args))
