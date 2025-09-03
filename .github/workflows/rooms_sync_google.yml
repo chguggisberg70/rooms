@@ -52,10 +52,34 @@ jobs:
           ${{ secrets.PLAYWRIGHT_AUTH_STATE }}
           JSON
           # Sanity-Checks
-          test -s storage_state.json || { echo "storage_state.json ist leer – Secret prüfen."; exit 2; }
-          jq -e . storage_state.json >/dev/null 2>&1 || { echo "Ungültiges JSON im Secret."; exit 3; }
+          test -s storage_state.json || { echo "❌ storage_state.json ist leer – Secret prüfen."; exit 2; }
+          if command -v jq >/dev/null 2>&1; then
+            jq -e . storage_state.json >/dev/null 2>&1 || { echo "❌ Ungültiges JSON im Secret."; exit 3; }
+          else
+            echo "⚠️ jq nicht installiert – JSON wird nicht geprüft."
+          fi
+          # Muss die 3vrooms-Domain enthalten
+          grep -q '"domain": "bfh.book.3vrooms.app"' storage_state.json || { echo "❌ 3vrooms-Cookies fehlen (bfh.book.3vrooms.app)."; exit 4; }
 
-      - name: Run sync with retries
+      - name: Check storage_state.json presence (no content)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lah .
+          # Ausgabe von Grösse und Hash ohne Inhalt zu leaken
+          if command -v stat >/dev/null 2>&1; then
+            echo "Size (bytes): $(stat -c%s storage_state.json 2>/dev/null || stat -f%z storage_state.json)"
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum storage_state.json
+          elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 storage_state.json
+          else
+            echo "⚠️ Kein SHA256-Tool verfügbar."
+          fi
+          echo "✅ storage_state.json vorhanden."
+
+      - name: Run sync with retries (headless)
         shell: bash
         env:
           ROOMS_NAV_TIMEOUT_MS: "180000"
@@ -72,7 +96,8 @@ jobs:
               --storage-state storage_state.json \
               --calendar "Rooms_BFH_Kilchenmann" \
               --split-by standort \
-              --timeout 240000
+              --timeout 240000 \
+              --headless
             then
               echo "Run erfolgreich."
               rc=0
