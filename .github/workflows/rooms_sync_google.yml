@@ -2,11 +2,13 @@ name: Run BFH Rooms Sync
 
 on:
   workflow_dispatch:
-  # Aktiviere deine gewünschten Zeiten hier:
   # schedule:
   #   - cron: '0 6,11,16 * 3-10 1-6'
   #   - cron: '0 7,12,17 * 11-12 1-6'
   #   - cron: '0 7,12,17 * 1-2 1-6'
+
+permissions:
+  contents: read
 
 concurrency:
   group: rooms_sync_google
@@ -14,86 +16,96 @@ concurrency:
 
 jobs:
   run:
-    # Falls dein Runner nur "self-hosted" trägt, lass es so.
-    # Wenn er auch Linux/X64 Labels hat: runs-on: [self-hosted, Linux, X64]
     runs-on: self-hosted
     timeout-minutes: 45
     env:
       TZ: Europe/Zurich
       PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          cache: 'pip'
 
       - name: Install deps (pip + Playwright Chromium)
         shell: bash
         run: |
+          set -euxo pipefail
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
       - name: Write storage_state.json from secret
         shell: bash
         run: |
-          # Multiline-sicherer Here-Doc. Secret: PLAYWRIGHT_AUTH_STATE
+          set -euo pipefail
+          # Secret: PLAYWRIGHT_AUTH_STATE (mehrzeilig erlaubt)
+          install -m 600 /dev/null storage_state.json
           cat > storage_state.json <<'JSON'
           ${{ secrets.PLAYWRIGHT_AUTH_STATE }}
           JSON
-          # Sanity-Check: Datei darf nicht leer sein
-          test -s storage_state.json || { echo "storage_state.json ist leer – Secret falsch?"; exit 2; }
+          # Sanity-Checks
+          test -s storage_state.json || { echo "storage_state.json ist leer – Secret prüfen."; exit 2; }
+          jq -e . storage_state.json >/dev/null 2>&1 || { echo "Ungültiges JSON im Secret."; exit 3; }
 
       - name: Run sync with retries
         shell: bash
         env:
-          # Optional: zusätzliche Timeouts für dein Script (falls unterstützt)
           ROOMS_NAV_TIMEOUT_MS: "180000"
           ROOMS_GOTO_TIMEOUT_MS: "180000"
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p artifacts_sync
           attempts=(1 2 3)
-          delays=(10 30 60)  # Sekunden Backoff
+          delays=(10 30 60)
+          rc=0
           for i in "${!attempts[@]}"; do
             echo "=== Versuch ${attempts[$i]} von ${#attempts[@]} ==="
-            # Beispiel-Start – passe Flags an deine CLI an
-            python rooms_sync_google.py \
+            if python rooms_sync_google.py \
               --storage-state storage_state.json \
               --calendar "Rooms_BFH_Kilchenmann" \
               --split-by standort \
-              --timeout 240000 && break || rc=$?
-
-            echo "Run fehlgeschlagen (Exit $rc)."
-            if [ "$i" -lt "$(( ${#attempts[@]} - 1 ))" ]; then
-              echo "Warte ${delays[$i]}s und versuche erneut…"
-              sleep "${delays[$i]}"
+              --timeout 240000
+            then
+              echo "Run erfolgreich."
+              rc=0
+              break
             else
-              echo "Alle Versuche fehlgeschlagen."
-              exit "$rc"
+              rc=$?
+              echo "Run fehlgeschlagen (Exit $rc)."
+              if [ "$i" -lt "$(( ${#attempts[@]} - 1 ))" ]; then
+                echo "Warte ${delays[$i]}s und versuche erneut…"
+                sleep "${delays[$i]}"
+              else
+                echo "Alle Versuche fehlgeschlagen."
+              fi
             fi
           done
+          exit "$rc"
 
-      - name: Upload artifacts for debugging
+      - name: Upload artifacts for debugging (ohne Secrets)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rooms-artifacts
           path: |
             artifacts_sync/**
-            storage_state.json
             **/playwright-report/**
             **/trace.zip
           if-no-files-found: ignore
           compression-level: 6
+          retention-days: 7
+
+      - name: Securely delete storage_state.json
+        if: always()
+        shell: bash
+        run: |
+          # Datei sicher entfernen (auf Self-Hosted Runnern sinnvoll)
+          shred -u -z -n 3 storage_state.json || rm -f storage_state.json
